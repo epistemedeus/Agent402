@@ -40,6 +40,15 @@ import { acceptsFromLive402, quoteFromAccepts, probeMethodsFor, isQuoteResponse 
 import { summarize, fmtUsd, fmtPct } from "./economy.js";
 import { rankBy, canonicalHost } from "./leaderboard.js";
 import { routeExecuteHint } from "./tools/route-execute.js";
+import {
+  requestContractFromOperation,
+  requestContractFromBazaarItem,
+  requestContractFromDiscovery,
+  requestContractStorage,
+  requestContractStorageProjection,
+  preferRequestContractStorage,
+  requestContractProjection,
+} from "./request-contract.js";
 
 // RAILS caip2 -> CHAIN_PAGES key, same join the homepage's by-chain strip uses
 // (see ledger-home.js) so /index's own row derives the same way: page
@@ -522,6 +531,7 @@ export function bazaarItemToTool(item, originUrl) {
     category: tags[0] || "other",
     tags,
     price,
+    requestContractEvidence: requestContractStorage(requestContractFromBazaarItem(item)),
     // Every chain this resource's 402 advertises — the signal behind the
     // router's ?network= filter ("who else settles on Robinhood Chain?").
     networks: [...new Set(accepts.map((a) => a?.network).filter(Boolean))],
@@ -622,6 +632,9 @@ export function normaliseOpenapiTools(openapi, originUrl) {
         category: tags[0] || "other",
         tags,
         price: op["x-price"] || op["x-x402-price"] || op["x-payment-info"]?.price?.amount || op["x-x402-price-usdc"] || null,
+        requestContractEvidence: requestContractStorage(
+          requestContractFromOperation(openapi, method, pathStr, op, methods),
+        ),
         ...(documentDistinguishesPaidOperations ? { paid: annotated } : {}),
       });
     }
@@ -987,9 +1000,31 @@ export function mergeManifestIntoTools(manifestTools = [], existing = []) {
     )];
     const forceObserved =
       manifestMethods.length <= 1 && observedMethods.length === 1 ? observedMethods[0] : null;
+    const requestEvidenceByMethod = new Map();
+    for (const i of indices) {
+      const method = String(existing[i].method || "").toUpperCase();
+      const projected = requestContractStorageProjection(existing[i]);
+      if (method && projected.requestContractEvidence) requestEvidenceByMethod.set(method, projected);
+    }
     for (const i of indices) replaced.add(i);
     for (const e of entries) {
-      append.push({ ...e, method: forceObserved || e.method || "GET" });
+      const method = forceObserved || e.method || "GET";
+      const inherited = requestEvidenceByMethod.get(String(method).toUpperCase()) || {};
+      // A query-template variant is a different concrete call. Reusing the
+      // base operation's example can attach contradictory inputs to it, so
+      // retain the required-field report but downgrade the example until the
+      // manifest itself publishes a structured contract.
+      const safeEvidence = String(e.route || "").includes("?") && inherited.requestContractEvidence
+        ? { requestContractEvidence: [
+            inherited.requestContractEvidence[0],
+            inherited.requestContractEvidence[1] === "a" ? "a" : "m",
+            inherited.requestContractEvidence[2] || {},
+            null,
+            inherited.requestContractEvidence[4] || 0,
+            inherited.requestContractEvidence[5] || 0,
+          ] }
+        : inherited;
+      append.push({ ...e, method, ...safeEvidence });
     }
   }
   const out = existing.filter((_, i) => !replaced.has(i));
@@ -1243,6 +1278,7 @@ export function mergeOpenapiIntoBazaar(openapiTools = [], bazaarTools = [], { al
         origin: microUsdToPrice(originMicro),
       },
     } : {}),
+    ...preferRequestContractStorage(o, b),
     // A registry row IS a settlement record: an operation the document left
     // unannotated (paid:false) that has real settled payments is buyable —
     // observed truth beats the doc's silence. An explicit zero price stays free.
@@ -2112,6 +2148,7 @@ function buildLocalEntry({ baseUrl, catalog, prices, network, toolCount, walletN
     category: t.category,
     tags: t.tags || [],
     price: prices?.[t.slug] ?? parsePrice(t.price),
+    requestContractEvidence: requestContractStorage(requestContractFromDiscovery(t)),
   }));
   return {
     origin: LOCAL_SELLER,
@@ -2376,6 +2413,7 @@ export function sellerDetail(originOrHost) {
         name: t.name || null,
         price: t.price ?? null,
         ...priceConflictProjection(t),
+        ...requestContractProjection(t),
         ...(t.paid !== undefined ? { paid: t.paid } : {}),
         networks: t.networks || undefined,
       })),
@@ -2729,6 +2767,7 @@ export function routeQuery({ query, top, include, networkFilter, baseUrl, catalo
       price: t.price,
       priceUsd: parsePrice(t.price),
       ...priceConflictProjection(t),
+      ...requestContractProjection(t),
       // "x402" = we have positive evidence this is payable in-protocol (a price,
       // or a registry accepts entry someone settled against). "unknown" = we
       // have none, which is NOT the same as "not payable" - see payabilityOf.
@@ -3448,6 +3487,7 @@ function flattenedThirdPartyTools(excludeOrigin = "") {
         // a measurement taken during this audit came out wrong.
         price: t?.price ?? null,
         ...priceConflictProjection(t),
+        ...requestContractProjection(t),
         // The identifier a caller needs to actually invoke the tool. Present on
         // /api/route and /api/find, missing here, on the surface that lists all
         // 65k third-party rows.
