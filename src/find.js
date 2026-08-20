@@ -8,7 +8,6 @@ import { toolList } from "./pages.js";
 import { rankSkillPacks } from "./skills.js";
 import { UNIT_CATEGORIES } from "./tools/convert-gen.js";
 import { UNIT_ALIASES } from "./tools/kit2.js";
-import { requestContractProjectionFromDiscovery } from "./request-contract.js";
 
 // Common English stopwords that contribute noise instead of intent. Kept short
 // on purpose — every word here matches many tool descriptions, so dropping it
@@ -247,7 +246,6 @@ export function findTools(catalog, query, { k = 5, baseUrl = "", powSlugs } = {}
       example,
       required,
       inputSchema: t.discovery?.inputSchema,
-      ...requestContractProjectionFromDiscovery(t),
       category: t.category,
       description: t.description,
       score,

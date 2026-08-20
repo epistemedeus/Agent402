@@ -61,7 +61,6 @@ import { findTools, findRelatedSellers } from "./find.js";
 import { recordWish, getWishesAggregate, annotateServed } from "./wish.js";
 import { indexSnapshot, sellerDetail, routableSellerSummaries, routeQuery, startCrawler, validateOriginInput, registerOrigin, allIndexedTools, indexedToolCategories } from "./x402-index.js";
 import { indexToolsPage, INDEX_TOOLS_PAGE_SIZE } from "./index-tools-page.js";
-import { requestContractProjectionFromDiscovery } from "./request-contract.js";
 import { getLeaderboardSnapshot, startLeaderboardRefresh, leaderboardPage, rankBy } from "./leaderboard.js";
 import { buildPaymentMiddleware, enabledNetworks, isIdentityBoundRoute, railStatus} from "./payments.js";
 import { createMppShim } from "./mpp-shim.js";
@@ -2883,7 +2882,6 @@ function ourToolsAsIndexRows() {
     // the external row by scripts/test-projection-parity.js.
     price: t.price ?? null,
     payable: "x402",   // every tool in our own catalog is priced and payable
-    ...requestContractProjectionFromDiscovery(t),
     networks: enabledNetworks(NETWORK),
   }));
 }

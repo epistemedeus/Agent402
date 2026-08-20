@@ -6,6 +6,8 @@
 // one hostile OpenAPI document cannot turn the index cache into a secret or
 // memory sink.
 
+import { looksLikeListingInjection } from "./listing-injection.js";
+
 const LOCATIONS = ["path", "query", "header", "body"];
 const MAX_REQUIRED = 16;
 const MAX_REQUIRED_NAME = 96;
@@ -39,7 +41,7 @@ function prototypeSpecial(value) {
 
 function safeName(value) {
   const name = String(value || "");
-  return name && name.length <= MAX_REQUIRED_NAME && !prototypeSpecial(name) && !/[\u0000-\u001f\u007f]/.test(name) ? name : null;
+  return name && name.length <= MAX_REQUIRED_NAME && !prototypeSpecial(name) && !/[\u0000-\u001f\u007f]/.test(name) && !looksLikeListingInjection(name) ? name : null;
 }
 
 function pointerPart(value) {
@@ -124,7 +126,7 @@ function safeScalar(value) {
     // A seller can put a credential in an innocently named field. Names and
     // schema markers are therefore only the first privacy boundary: reject
     // common secret and identity value shapes before anything enters cache.
-    if (secretValueShape(value)) return { ok: false };
+    if (secretValueShape(value) || looksLikeListingInjection(value)) return { ok: false };
     if (/^https?:\/\//i.test(value)) {
       try {
         const parsed = new URL(value);
@@ -173,21 +175,31 @@ function sanitizeExample(value, depth = 0) {
 
 function requiredSchemaPaths(document, rawSchema, prefix = "", depth = 0, seen = new Set()) {
   if (depth > MAX_EXAMPLE_DEPTH) return { paths: [], truncated: true, redacted: 0 };
-  const schema = resolveLocalRef(document, rawSchema, new Set(seen), { schema: true });
+  const ref = typeof rawSchema?.$ref === "string" ? rawSchema.$ref : null;
+  if (ref && seen.has(ref)) return { paths: [], truncated: true, redacted: 0 };
+  const schema = resolveLocalRef(document, rawSchema, seen, { schema: true });
   if (!schema || typeof schema !== "object") return { paths: [], truncated: false, redacted: 0 };
+  if (seen.has(schema)) return { paths: [], truncated: true, redacted: 0 };
+  seen.add(schema);
   if (schema.type === "array" && schema.items) {
     return requiredSchemaPaths(document, schema.items, prefix ? `${prefix}[]` : "[]", depth + 1, seen);
   }
   const paths = [];
   let truncated = false;
   let redacted = 0;
-  for (const rawName of Array.isArray(schema.required) ? schema.required : []) {
+  const requiredNames = Array.isArray(schema.required) ? schema.required : [];
+  if (requiredNames.length > MAX_REQUIRED) truncated = true;
+  for (const rawName of requiredNames.slice(0, MAX_REQUIRED)) {
+    if (paths.length >= MAX_REQUIRED) {
+      truncated = true;
+      break;
+    }
     const name = safeName(rawName);
     if (!name) {
       truncated = true;
       continue;
     }
-    const property = resolveLocalRef(document, schema.properties?.[name], new Set(), { schema: true });
+    const property = resolveLocalRef(document, schema.properties?.[name], seen, { schema: true });
     // OpenAPI required+readOnly means required in responses, not in requests.
     if (property?.readOnly === true) continue;
     if (privateValueLike(name, property)) {
@@ -195,12 +207,18 @@ function requiredSchemaPaths(document, rawSchema, prefix = "", depth = 0, seen =
       continue;
     }
     const path = prefix ? `${prefix}.${name}` : String(name);
-    if (paths.length < MAX_REQUIRED) paths.push(path);
-    else truncated = true;
+    paths.push(path);
+    if (paths.length >= MAX_REQUIRED) {
+      truncated = true;
+      break;
+    }
     const child = requiredSchemaPaths(document, property, path, depth + 1, seen);
     for (const childPath of child.paths) {
       if (paths.length < MAX_REQUIRED) paths.push(childPath);
-      else truncated = true;
+      else {
+        truncated = true;
+        break;
+      }
     }
     truncated ||= child.truncated;
     redacted += child.redacted;
@@ -431,6 +449,10 @@ export function requestContractFromOperation(document, method, route, operation,
     const isRequired = parameter.required === true || where === "path";
     if (!isRequired) continue;
     encounteredRequired++;
+    if (encounteredRequired > MAX_REQUIRED) {
+      truncated = true;
+      break;
+    }
     const parameterMedia = !parameter.schema && parameter.content && typeof parameter.content === "object"
       ? Object.values(parameter.content).find((entry) => entry && typeof entry === "object")
       : null;
@@ -625,15 +647,30 @@ export function requestContractStorageProjection(tool) {
   return {};
 }
 
+function unknownRequestContract() {
+  return {
+    requestContract: {
+      source: "none",
+      state: "unknown",
+      required: {},
+      runtimeVerified: false,
+    },
+  };
+}
+
 /** Expand the compact tuple on every public marketplace projection. */
 export function requestContractProjection(tool) {
-  const rawStored = Array.isArray(tool?.requestContractEvidence)
+  const hasTuple = Array.isArray(tool?.requestContractEvidence)
+    || (tool?.requestContract && typeof tool.requestContract === "object");
+  if (!hasTuple) return unknownRequestContract();
+  const rawStored = Array.isArray(tool.requestContractEvidence)
     ? tool.requestContractEvidence
-    : tool?.requestContract && typeof tool.requestContract === "object"
-      ? requestContractStorage(tool.requestContract)
-      : ["n", "a", {}, null, 0, 0];
+    : requestContractStorage(tool.requestContract);
   const stored = normalizeStoredTuple(rawStored);
   const source = stored[0] === "c" ? "seller_catalog" : stored[0] === "o" ? "seller_openapi" : stored[0] === "b" ? "seller_bazaar" : "none";
+  // source "n" is not a seller-authored tuple — we have no evidence, which is
+  // not the same as "this operation declared no required input".
+  if (source === "none") return unknownRequestContract();
   const state = stored[1] === "d" ? "declared" : stored[1] === "m" ? "missing_example" : "absent";
   const required = stored[2] && typeof stored[2] === "object" ? stored[2] : {};
   const example = stored[3] && typeof stored[3] === "object" ? stored[3] : null;
