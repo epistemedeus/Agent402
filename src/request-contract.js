@@ -75,22 +75,31 @@ function firstExample(value) {
   return undefined;
 }
 
-function authoredSchemaExample(document, rawSchema, depth = 0) {
+function authoredSchemaExample(document, rawSchema, depth = 0, seen = new Set()) {
   if (depth > MAX_EXAMPLE_DEPTH) return undefined;
-  const schema = resolveLocalRef(document, rawSchema, new Set(), { schema: true });
-  if (!schema || typeof schema !== "object") return undefined;
+  const ref = typeof rawSchema?.$ref === "string" ? rawSchema.$ref : null;
+  if (ref && seen.has(ref)) return undefined;
+  const walkSeen = new Set(seen);
+  const schema = resolveLocalRef(document, rawSchema, walkSeen, { schema: true });
+  if (!schema || typeof schema !== "object" || walkSeen.has(schema)) return undefined;
+  walkSeen.add(schema);
   if (schema.example !== undefined) return schema.example;
   if (schema.type === "object" || schema.properties) {
     const out = Object.create(null);
-    for (const [name, property] of Object.entries(schema.properties || {}).slice(0, MAX_EXAMPLE_KEYS)) {
-      if (!safeName(name)) continue;
-      const example = authoredSchemaExample(document, property, depth + 1);
+    // Walk required names only, and never enumerate a hostile properties object.
+    const names = Array.isArray(schema.required) && schema.required.length
+      ? schema.required
+      : Object.keys(schema.properties || {});
+    for (const rawName of names.slice(0, MAX_EXAMPLE_KEYS)) {
+      const name = safeName(rawName);
+      if (!name) continue;
+      const example = authoredSchemaExample(document, schema.properties?.[name], depth + 1, walkSeen);
       if (example !== undefined) out[name] = example;
     }
     return Object.keys(out).length ? out : undefined;
   }
   if (schema.type === "array" && schema.items) {
-    const item = authoredSchemaExample(document, schema.items, depth + 1);
+    const item = authoredSchemaExample(document, schema.items, depth + 1, walkSeen);
     return item === undefined ? undefined : [item];
   }
   return undefined;
@@ -177,12 +186,13 @@ function requiredSchemaPaths(document, rawSchema, prefix = "", depth = 0, seen =
   if (depth > MAX_EXAMPLE_DEPTH) return { paths: [], truncated: true, redacted: 0 };
   const ref = typeof rawSchema?.$ref === "string" ? rawSchema.$ref : null;
   if (ref && seen.has(ref)) return { paths: [], truncated: true, redacted: 0 };
-  const schema = resolveLocalRef(document, rawSchema, seen, { schema: true });
+  const walkSeen = new Set(seen);
+  const schema = resolveLocalRef(document, rawSchema, walkSeen, { schema: true });
   if (!schema || typeof schema !== "object") return { paths: [], truncated: false, redacted: 0 };
-  if (seen.has(schema)) return { paths: [], truncated: true, redacted: 0 };
-  seen.add(schema);
+  if (walkSeen.has(schema)) return { paths: [], truncated: true, redacted: 0 };
+  walkSeen.add(schema);
   if (schema.type === "array" && schema.items) {
-    return requiredSchemaPaths(document, schema.items, prefix ? `${prefix}[]` : "[]", depth + 1, seen);
+    return requiredSchemaPaths(document, schema.items, prefix ? `${prefix}[]` : "[]", depth + 1, walkSeen);
   }
   const paths = [];
   let truncated = false;
@@ -199,7 +209,7 @@ function requiredSchemaPaths(document, rawSchema, prefix = "", depth = 0, seen =
       truncated = true;
       continue;
     }
-    const property = resolveLocalRef(document, schema.properties?.[name], seen, { schema: true });
+    const property = resolveLocalRef(document, schema.properties?.[name], new Set(walkSeen), { schema: true });
     // OpenAPI required+readOnly means required in responses, not in requests.
     if (property?.readOnly === true) continue;
     if (privateValueLike(name, property)) {
@@ -212,7 +222,7 @@ function requiredSchemaPaths(document, rawSchema, prefix = "", depth = 0, seen =
       truncated = true;
       break;
     }
-    const child = requiredSchemaPaths(document, property, path, depth + 1, seen);
+    const child = requiredSchemaPaths(document, schema.properties?.[name], path, depth + 1, walkSeen);
     for (const childPath of child.paths) {
       if (paths.length < MAX_REQUIRED) paths.push(childPath);
       else {
@@ -226,21 +236,26 @@ function requiredSchemaPaths(document, rawSchema, prefix = "", depth = 0, seen =
   return { paths: [...new Set(paths)], truncated, redacted };
 }
 
-function requiredOnlyExample(document, rawSchema, value, depth = 0) {
+function requiredOnlyExample(document, rawSchema, value, depth = 0, seen = new Set()) {
   if (depth > MAX_EXAMPLE_DEPTH) return { ok: false };
-  const schema = resolveLocalRef(document, rawSchema, new Set(), { schema: true });
+  const ref = typeof rawSchema?.$ref === "string" ? rawSchema.$ref : null;
+  if (ref && seen.has(ref)) return { ok: false };
+  const walkSeen = new Set(seen);
+  const schema = resolveLocalRef(document, rawSchema, walkSeen, { schema: true });
   if (!schema || typeof schema !== "object") return sanitizeExample(value, depth);
+  if (walkSeen.has(schema)) return { ok: false };
+  walkSeen.add(schema);
   if (schema.type === "array" || schema.items) {
     if (!Array.isArray(value) || value.length > MAX_EXAMPLE_ARRAY) return { ok: false };
     const out = [];
     for (const item of value) {
-      const clean = requiredOnlyExample(document, schema.items, item, depth + 1);
+      const clean = requiredOnlyExample(document, schema.items, item, depth + 1, walkSeen);
       if (!clean.ok) return { ok: false };
       out.push(clean.value);
     }
     return { ok: true, value: out };
   }
-  const required = Array.isArray(schema.required) ? schema.required : [];
+  const required = Array.isArray(schema.required) ? schema.required.slice(0, MAX_REQUIRED) : [];
   if ((schema.type === "object" || schema.properties) && required.length === 0) {
     return value && typeof value === "object" && !Array.isArray(value) ? { ok: true, value: {} } : { ok: false };
   }
@@ -249,11 +264,11 @@ function requiredOnlyExample(document, rawSchema, value, depth = 0) {
     const out = Object.create(null);
     for (const rawName of required) {
       const name = safeName(rawName);
-      const property = resolveLocalRef(document, schema.properties?.[name], new Set(), { schema: true });
+      const property = resolveLocalRef(document, schema.properties?.[name], new Set(walkSeen), { schema: true });
       if (property?.readOnly === true) continue;
       if (!name || privateValueLike(name, property)) continue;
       if (!(name in value)) return { ok: false };
-      const clean = requiredOnlyExample(document, property, value[name], depth + 1);
+      const clean = requiredOnlyExample(document, schema.properties?.[name], value[name], depth + 1, walkSeen);
       if (!clean.ok) return { ok: false };
       out[name] = clean.value;
     }
