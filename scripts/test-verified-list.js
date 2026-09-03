@@ -1,4 +1,4 @@
-// Verified-list preference (GB02): when routeQuery candidates TIE on the
+// Verified-list preference: when routeQuery candidates TIE on the
 // existing ranking, prefer a route present on an operator-configured HTTPS
 // JSON feed. Flag OFF by default. Offline — feed is injected, never fetched.
 import { routeQuery, _cacheForTests, _setBazaarQualityForTest } from "../src/x402-index.js";
