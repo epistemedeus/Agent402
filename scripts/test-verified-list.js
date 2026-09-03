@@ -35,21 +35,35 @@ const ctx = {
   walletName: "agent402.base.eth",
 };
 
-function seedEqualPair() {
+function seedPair({ a = {}, b = {} } = {}) {
   const cache = _cacheForTests();
   cache.clear();
-  _setBazaarQualityForTest("https://a.example", null);
-  _setBazaarQualityForTest("https://b.example", null);
-  const seed = (origin) => cache.set(origin, {
+  _setBazaarQualityForTest("https://a.example", a.bazaar === undefined ? null : a.bazaar);
+  _setBazaarQualityForTest("https://b.example", b.bazaar === undefined ? null : b.bazaar);
+  const seed = (origin, over) => cache.set(origin, {
     manifest: { name: origin, homepage: origin },
     openapiSummary: null,
-    tools: [{ seller: origin, method: "POST", route: "/api/ocr", slug: "ocr", name: "ocr", description: "ocr a thing", category: "vision", tags: ["ocr"], price: 0.003 }],
+    tools: [{
+      seller: origin,
+      method: "POST",
+      route: "/api/ocr",
+      slug: "ocr",
+      name: "ocr",
+      description: "ocr a thing",
+      category: "vision",
+      tags: ["ocr"],
+      price: over.price ?? 0.003,
+    }],
     fetchedAt: Date.now(),
     error: null,
-    history: [1, 1, 1, 1, 1],
+    history: over.history ?? [1, 1, 1, 1, 1],
   });
-  seed("https://a.example");
-  seed("https://b.example");
+  seed("https://a.example", a);
+  seed("https://b.example", b);
+}
+
+function seedEqualPair() {
+  seedPair();
 }
 
 function extSellers(queryOpts = {}) {
@@ -154,12 +168,42 @@ cache.set("https://a.example", {
 const scored = extSellers({ query: "unique-ocr" });
 ok(scored[0].seller === "https://a.example", "flag on: a stronger lexical match still beats a listed peer");
 
+// Stronger existing keys still beat a listed peer (verified-list is last-resort).
+process.env.X402_VERIFIED_LIST = "on";
+_setVerifiedListForTest(parseVerifiedFeed({ routes: ["https://b.example/api/ocr"] }));
+seedPair({ a: { history: [1, 1, 1, 1, 1] }, b: { history: [0, 0, 0, 0, 1] } });
+const healthier = extSellers();
+ok(healthier[0]?.seller === "https://a.example",
+  `flag on: a healthier unlisted peer still beats a listed peer (got ${healthier.map((x) => x.seller).join(", ")})`);
+seedPair({
+  a: { bazaar: { calls30d: 10, payers30d: 50, lastCalledAt: "2026-08-18T00:00:00Z" } },
+  b: { bazaar: { calls30d: 3, payers30d: 2, lastCalledAt: "2026-08-10T00:00:00Z" } },
+});
+const payers = extSellers();
+ok(payers[0]?.seller === "https://a.example",
+  `flag on: more Bazaar payers still beat a listed peer (got ${payers.map((x) => x.seller).join(", ")})`);
+seedPair({ a: { price: 0.001 }, b: { price: 0.003 } });
+const cheaper = extSellers();
+ok(cheaper[0]?.seller === "https://a.example",
+  `flag on: a cheaper known price still beats a listed peer (got ${cheaper.map((x) => x.seller).join(", ")})`);
+
 // Refresh: injected fetch, no network. Failed refresh keeps the previous set.
 process.env.X402_VERIFIED_LIST = "on";
 _setVerifiedListForTest(parseVerifiedFeed({ sellers: ["https://keep.example"] }));
 await refreshVerifiedList({ fetchImpl: async () => { throw new Error("boom"); } });
 ok(routeOnVerifiedList({ seller: "https://keep.example", route: "/", method: "GET" }) === true,
   "flag on: failed refresh keeps the previous feed");
+// HTTP 404: same fail-open as safeFetch (4xx → throw with upstreamStatus 404).
+await refreshVerifiedList({
+  fetchImpl: async () => {
+    throw Object.assign(
+      new Error("Source URL returned HTTP 404 - check the URL is correct and publicly reachable"),
+      { statusCode: 422, upstreamStatus: 404 },
+    );
+  },
+});
+ok(routeOnVerifiedList({ seller: "https://keep.example", route: "/", method: "GET" }) === true,
+  "flag on: HTTP 404 refresh keeps the previous feed (fail-open)");
 await refreshVerifiedList({ fetchImpl: async () => ({ html: JSON.stringify({ sellers: ["https://new.example"] }) }) });
 ok(routeOnVerifiedList({ seller: "https://new.example", route: "/", method: "GET" }) === true
   && routeOnVerifiedList({ seller: "https://keep.example", route: "/", method: "GET" }) === false,
