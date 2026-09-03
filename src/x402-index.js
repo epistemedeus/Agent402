@@ -46,6 +46,7 @@ import { summarize, fmtUsd, fmtPct } from "./economy.js";
 import { rankBy, canonicalHost, getLeaderboardSnapshot } from "./leaderboard.js";
 import { routeExecuteHint } from "./tools/route-execute.js";
 import { recordSellerRegistrationSeen, getSellerRegistrations } from "./stats.js";
+import { verifiedListEnabled, routeOnVerifiedList, startVerifiedListRefresh, stopVerifiedListRefresh } from "./verified-list.js";
 
 // RAILS caip2 -> CHAIN_PAGES key, same join the homepage's by-chain strip uses
 // (see ledger-home.js) so /index's own row derives the same way: page
@@ -3281,6 +3282,8 @@ export function startCrawler(opts = {}) {
   if (typeof firstCrawlTimer.unref === "function") firstCrawlTimer.unref();
   crawlerTimer = setInterval(() => { runCrawl().then(() => persistIndexCacheAsync()).catch(() => {}); }, CRAWL_INTERVAL_MS);
   discoveryTimer = setInterval(() => runDiscovery(selfOrigin), DISCOVERY_INTERVAL_MS);
+  // Verified-list feed: no-op unless X402_VERIFIED_LIST=on (default off).
+  startVerifiedListRefresh();
   // Don't keep the event loop alive on shutdown.
   if (typeof crawlerTimer.unref === "function") crawlerTimer.unref();
   if (typeof discoveryTimer.unref === "function") discoveryTimer.unref();
@@ -3300,6 +3303,7 @@ export function stopCrawler() {
     clearInterval(discoveryTimer);
     discoveryTimer = null;
   }
+  stopVerifiedListRefresh();
 }
 
 function buildLocalEntry({ baseUrl, catalog, prices, network, toolCount, walletName }) {
@@ -4074,7 +4078,16 @@ export function routeQuery({ query, top, include, networkFilter, strictNetwork =
       if (qb !== qa) return qb - qa;
     }
     if (a[3] !== b[3]) return a[3] - b[3];
-    return (a[1].slug || "").length - (b[1].slug || "").length;
+    const slugLen = (a[1].slug || "").length - (b[1].slug || "").length;
+    if (slugLen !== 0) return slugLen;
+    // Verified-list preference (X402_VERIFIED_LIST, default off): only fires
+    // when every existing key already tied. Presence on the operator-configured
+    // feed is a last-resort tiebreak, never a score bump, and never consulted
+    // when the flag is off.
+    if (!verifiedListEnabled()) return 0;
+    const va = routeOnVerifiedList(a[1]) ? 1 : 0;
+    const vb = routeOnVerifiedList(b[1]) ? 1 : 0;
+    return vb - va;
   });
 
   // Per-seller diversity cap (M6, "Five Attacks on x402" Attack IV — Sybil /
@@ -4186,7 +4199,10 @@ export function routeQuery({ query, top, include, networkFilter, strictNetwork =
         // after score, so saying which kind of number this is matters.
         healthSource: external ? "crawl" : "self-asserted",
         priceRank: (() => { const r = priceRank(t.price); return Number.isFinite(r) ? r : null; })(),
-        tiebreaks: ["score", "health", "cheapest known price", "shorter slug"],
+        tiebreaks: verifiedListEnabled()
+          ? ["score", "health", "cheapest known price", "shorter slug", "verified-list"]
+          : ["score", "health", "cheapest known price", "shorter slug"],
+        ...(verifiedListEnabled() ? { verifiedList: routeOnVerifiedList(t) } : {}),
       },
       category: t.category,
       description: t.description,
@@ -4222,7 +4238,9 @@ export function routeQuery({ query, top, include, networkFilter, strictNetwork =
     neutrality: {
       paidPlacement: false,
       sellerKeyedScoring: false,
-      ranking: "deterministic lexical match on slug, name and description; ties broken by health, then cheapest known price, then shorter slug",
+      ranking: verifiedListEnabled()
+        ? "deterministic lexical match on slug, name and description; ties broken by health, then cheapest known price, then shorter slug, then presence on the operator-configured verified-list feed"
+        : "deterministic lexical match on slug, name and description; ties broken by health, then cheapest known price, then shorter slug",
       // Was three entries. Two were removed rather than disclosed: the
       // per-seller diversity cap now applies to our catalog on the same terms
       // as everyone else's (measured cost of giving it up: it bound on 1 of 30
