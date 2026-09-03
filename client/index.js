@@ -696,4 +696,190 @@ export function withPayeeAllowlist(client, payees) {
   return client;
 }
 
+function normPayTo(a) {
+  return (typeof a === "string" && /^0x[0-9a-fA-F]{40}$/.test(a) ? a.toLowerCase() : String(a || "").trim());
+}
+
+function discoveryHost(urlOrHost) {
+  if (!urlOrHost) return "";
+  try {
+    const u = String(urlOrHost).includes("://") ? new URL(urlOrHost) : new URL(`https://${urlOrHost}`);
+    return u.host.toLowerCase();
+  } catch {
+    return String(urlOrHost).toLowerCase();
+  }
+}
+
+function discoveryRoute(urlOrPath) {
+  let path = "";
+  try {
+    path = String(urlOrPath).includes("://") ? new URL(urlOrPath).pathname : String(urlOrPath || "");
+  } catch {
+    path = String(urlOrPath || "");
+  }
+  if (!path || path === "/") return "/";
+  return path.replace(/\/+$/, "") || "/";
+}
+
+function discoveryResourceUrl(paymentRequired) {
+  const r = paymentRequired?.resource;
+  if (typeof r === "string") return r;
+  if (r && typeof r === "object") return r.url || r.uri || "";
+  return "";
+}
+
+function unixMs(ts) {
+  const n = Number(ts);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n > 1e12 ? n : n * 1000;
+}
+
+function classifyDiscoveryDoc(doc) {
+  if (!doc || typeof doc !== "object") return null;
+  if (Array.isArray(doc.items) && (doc.x402Version != null || doc.lastUpdated != null || doc.items[0]?.accepts)) return "x402";
+  if (doc.route && doc.contract) return "catalog";
+  if (doc.openapi && doc.paths) return "openapi";
+  return null;
+}
+
+function flattenDiscoveryDocs(input, out = []) {
+  if (input == null) return out;
+  if (Array.isArray(input)) {
+    for (const d of input) flattenDiscoveryDocs(d, out);
+    return out;
+  }
+  if (typeof input !== "object") return out;
+  const kind = classifyDiscoveryDoc(input);
+  if (kind) {
+    out.push(input);
+    return out;
+  }
+  if (input.x402 || input.openapi || input.catalog) {
+    flattenDiscoveryDocs(input.x402, out);
+    flattenDiscoveryDocs(input.openapi, out);
+    flattenDiscoveryDocs(input.catalog, out);
+  }
+  return out;
+}
+
+function rowFromAccept(host, route, a, source) {
+  return {
+    host,
+    route,
+    payTo: a?.payTo ? normPayTo(a.payTo) : "",
+    network: String(a?.network || "").toLowerCase(),
+    asset: a?.asset ? normPayTo(a.asset) : "",
+    scheme: String(a?.scheme || "").toLowerCase(),
+    source,
+  };
+}
+
+function rowsFromDiscoveryDoc(doc) {
+  const kind = classifyDiscoveryDoc(doc);
+  if (kind === "x402") {
+    const rows = [];
+    for (const item of doc.items || []) {
+      const res = item.resource || {};
+      const req = item.request || {};
+      const url = res.url || req.url || req.exampleUrl || "";
+      const host = discoveryHost(url || req.url || "");
+      const route = discoveryRoute(res.routeTemplate || url || req.url || "");
+      for (const a of item.accepts || []) rows.push(rowFromAccept(host, route, a, "x402"));
+    }
+    return { rows, lastUpdated: unixMs(doc.lastUpdated) };
+  }
+  if (kind === "catalog") {
+    const c = doc.contract || {};
+    return {
+      rows: [rowFromAccept(discoveryHost(doc.route.origin), discoveryRoute(doc.route.path), c, "catalog")],
+      lastUpdated: unixMs(doc.retrieved || doc.lastUpdated),
+    };
+  }
+  const rows = [];
+  const servers = Array.isArray(doc.servers) ? doc.servers : [];
+  const host = servers[0]?.url ? discoveryHost(servers[0].url) : "";
+  for (const [p, ops] of Object.entries(doc.paths || {})) {
+    if (!ops || typeof ops !== "object") continue;
+    for (const op of Object.values(ops)) {
+      if (!op || typeof op !== "object") continue;
+      const pay = op["x-payment-info"];
+      const protocols = Array.isArray(pay?.protocols) ? pay.protocols : [];
+      for (const proto of protocols) {
+        const x = proto && proto.x402;
+        if (!x) continue;
+        rows.push(rowFromAccept(host, discoveryRoute(p), x, "openapi"));
+      }
+    }
+  }
+  return { rows, lastUpdated: null };
+}
+
+function acceptMatchesDiscoveryRow(a, row) {
+  if (row.payTo && normPayTo(a?.payTo) !== row.payTo) return false;
+  if (row.network && String(a?.network || "").toLowerCase() !== row.network) return false;
+  if (row.asset && normPayTo(a?.asset) !== row.asset) return false;
+  if (row.scheme && String(a?.scheme || "").toLowerCase() !== row.scheme) return false;
+  return true;
+}
+
+/**
+ * Bind who gets paid AND which resource URL is payable to a published
+ * discovery document - a parsed `/.well-known/x402` body, an OpenAPI document
+ * with `x-payment-info`, a route+contract catalog pin, or any mix. Origin +
+ * route identity only (host case-insensitive; trailing slash, query, and
+ * fragment ignored); this does not rank. Same wrapping style as
+ * withPayeeAllowlist: throws before any signature exists when the 402 is
+ * foreign to the document, or when the document is stale (`lastUpdated` older
+ * than `maxAgeSeconds`). Pass already-parsed JSON; this helper does not fetch.
+ */
+export function withDiscoveryEvidence(client, documents, opts = {}) {
+  const docs = flattenDiscoveryDocs(documents);
+  if (!docs.length) throw new Error("withDiscoveryEvidence: at least one discovery document is required");
+  const rows = [];
+  const lastUpdateds = [];
+  let hasOpenApi = false;
+  for (const doc of docs) {
+    const parsed = rowsFromDiscoveryDoc(doc);
+    if (classifyDiscoveryDoc(doc) === "openapi") hasOpenApi = true;
+    rows.push(...parsed.rows);
+    if (parsed.lastUpdated) lastUpdateds.push(parsed.lastUpdated);
+  }
+  if (!rows.length) throw new Error("withDiscoveryEvidence: discovery document listed no payable routes");
+  const maxAgeSeconds = opts.maxAgeSeconds == null ? null : Number(opts.maxAgeSeconds);
+  const now = opts.now == null ? Date.now() : Number(opts.now);
+  const orig = client.createPaymentPayload.bind(client);
+  client.createPaymentPayload = (paymentRequired) => {
+    if (maxAgeSeconds != null && Number.isFinite(maxAgeSeconds) && maxAgeSeconds >= 0) {
+      if (!lastUpdateds.length) {
+        throw new Error("discovery evidence refused this quote: the document is stale (no lastUpdated; freshness was required)");
+      }
+      if (now - Math.max(...lastUpdateds) > maxAgeSeconds * 1000) {
+        throw new Error("discovery evidence refused this quote: the document is stale");
+      }
+    }
+    const resource = discoveryResourceUrl(paymentRequired);
+    if (!resource) throw new Error("discovery evidence refused this quote: the 402 named no resource URL");
+    const host = discoveryHost(resource);
+    const route = discoveryRoute(resource);
+    const covering = rows.filter((row) => row.host === host && row.route === route);
+    if (!covering.length || (hasOpenApi && !covering.some((r) => r.source === "openapi"))) {
+      throw new Error(`discovery evidence refused this quote: resource ${host}${route} is foreign to the published document`);
+    }
+    const identityRows = covering.filter((r) => r.payTo);
+    const specRows = covering.filter((r) => r.source === "openapi");
+    const list = Array.isArray(paymentRequired?.accepts) ? paymentRequired.accepts : [];
+    const picked = list.filter((a) => {
+      const idOk = (identityRows.length ? identityRows : covering).some((r) => acceptMatchesDiscoveryRow(a, r));
+      const specOk = !specRows.length || specRows.some((r) => acceptMatchesDiscoveryRow(a, r));
+      return idOk && specOk;
+    });
+    if (!picked.length) {
+      const offered = [...new Set(list.map((a) => a?.payTo).filter(Boolean))];
+      throw new Error(`discovery evidence refused this quote: no accept matched the published document (payTo [${offered.join(", ")}])`);
+    }
+    return orig({ ...paymentRequired, accepts: picked });
+  };
+  return client;
+}
+
 export default Agent402;

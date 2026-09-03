@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { Agent402, OutputValidationError, withNetworkPreference, withPayeeAllowlist, NETWORK_CAIP2 } from "./index.js";
+import { Agent402, OutputValidationError, withNetworkPreference, withPayeeAllowlist, withDiscoveryEvidence, NETWORK_CAIP2 } from "./index.js";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const PORT = 3081;
@@ -57,6 +57,91 @@ let pass = 0; const ok = (c, m) => { if (c) { pass++; console.log(`ok - ${m}`); 
   let empty = null; try { withPayeeAllowlist({ createPaymentPayload: async () => {} }, []); } catch (e) { empty = e; }
   if (!empty) { console.error("FAIL: withPayeeAllowlist with no payees must throw"); process.exit(1); }
   console.log("ok - withPayeeAllowlist filters accepts to allowlisted payees and refuses otherwise");
+}
+
+// Offline: withDiscoveryEvidence binds createPaymentPayload to a published
+// origin+route document (parsed /.well-known/x402, OpenAPI x-payment-info,
+// route+contract catalog pin). Reads the pin; refuses a foreign or stale
+// fixture before any signature exists. No fetch, no ranking, no wallet.
+{
+  const catalog = {
+    route: { origin: "https://agents.samedaydesk.com", method: "GET", path: "/extract" },
+    contract: {
+      scheme: "exact",
+      network: "eip155:8453",
+      payTo: "0x8904dF3DE6DFEe6a7C8cc38619d2f17806213Cee",
+      asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      amount: "5000",
+    },
+  };
+  const wellKnown = {
+    x402Version: 2,
+    lastUpdated: 1788454937,
+    items: [{
+      resource: { url: "https://agents.samedaydesk.com/extract?url=https%3A%2F%2Fexample.com", routeTemplate: "/extract" },
+      request: { method: "GET", url: "https://agents.samedaydesk.com/extract" },
+      accepts: [{
+        scheme: "exact",
+        network: "eip155:8453",
+        asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        amount: "5000",
+        payTo: "0x8904dF3DE6DFEe6a7C8cc38619d2f17806213Cee",
+      }],
+    }],
+  };
+  const openapi = {
+    openapi: "3.1.0",
+    info: { version: "1.23.40", title: "SameDayDesk" },
+    servers: [{ url: "https://agents.samedaydesk.com" }],
+    paths: {
+      "/extract": {
+        get: {
+          "x-payment-info": {
+            protocols: [{ x402: { asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", network: "eip155:8453", scheme: "exact" } }],
+          },
+        },
+      },
+    },
+  };
+  const goodAccept = {
+    scheme: "exact",
+    network: "eip155:8453",
+    asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    payTo: "0x8904dF3DE6DFEe6a7C8cc38619d2f17806213Cee",
+    amount: "5000",
+  };
+  const paymentRequired = {
+    resource: { url: "https://agents.samedaydesk.com/extract?url=https://example.com" },
+    accepts: [
+      goodAccept,
+      { scheme: "exact", network: "eip155:8453", asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", payTo: "0x9999999999999999999999999999999999999999", amount: "5000" },
+    ],
+  };
+  const calls = [];
+  const fake = { createPaymentPayload: (pr) => { calls.push(pr); return { ok: true }; } };
+  withDiscoveryEvidence(fake, { x402: wellKnown, openapi, catalog });
+  ok(fake.createPaymentPayload(paymentRequired).ok === true, "withDiscoveryEvidence reads the published extract pin and delegates");
+  ok(calls.length === 1 && calls[0].accepts.length === 1 && calls[0].accepts[0].payTo === goodAccept.payTo,
+    "withDiscoveryEvidence keeps only the accept whose origin+route+payTo match the document");
+
+  let foreign = null;
+  try {
+    fake.createPaymentPayload({
+      resource: { url: "https://evil.example/extract?url=https://example.com" },
+      accepts: [goodAccept],
+    });
+  } catch (e) { foreign = e; }
+  ok(foreign && /foreign/.test(foreign.message), "withDiscoveryEvidence rejects a foreign fixture (wrong origin)");
+
+  const staleClient = { createPaymentPayload: () => ({ ok: true }) };
+  withDiscoveryEvidence(staleClient, { ...wellKnown, lastUpdated: 1_600_000_000 }, { now: 1_788_454_937_000, maxAgeSeconds: 86_400 });
+  let stale = null;
+  try { staleClient.createPaymentPayload(paymentRequired); } catch (e) { stale = e; }
+  ok(stale && /stale/.test(stale.message), "withDiscoveryEvidence rejects a stale fixture (lastUpdated older than maxAgeSeconds)");
+
+  let empty = null;
+  try { withDiscoveryEvidence({ createPaymentPayload: () => {} }, []); } catch (e) { empty = e; }
+  ok(empty, "withDiscoveryEvidence with no documents must throw");
 }
 // Offline: buyer spending caps refuse to overpay BEFORE signing (defends the
 // x402 "wallet drain via uncapped spending" failure mode). No server needed  - 

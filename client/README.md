@@ -351,6 +351,27 @@ const payFetch = wrapFetchWithPayment(fetch, client);
 Pairs with `maxPerCallUsd` / `dailyLimitUsd` (how much) and
 `withNetworkPreference` (which chain).
 
+## Only pay a published origin+route (`withDiscoveryEvidence`)
+
+The origin+route twin of `withPayeeAllowlist`. Pass an already-parsed
+`/.well-known/x402` document, an OpenAPI document with `x-payment-info`, a
+catalog pin `{ route, contract }`, or any mix. A 402 whose resource host+path
+is not in that document (or whose `payTo` / network / asset disagrees) is
+refused before a signature exists. Hosts compare case-insensitively; trailing
+slash, query, and fragment are ignored. This does not rank, fetch, or pay.
+
+```js
+import { withDiscoveryEvidence } from "agent402-client";
+
+const x402 = await (await fetch("https://agents.example/.well-known/x402")).json();
+const openapi = await (await fetch("https://agents.example/openapi.json")).json();
+withDiscoveryEvidence(client, { x402, openapi }, { maxAgeSeconds: 7 * 24 * 60 * 60 });
+const payFetch = wrapFetchWithPayment(fetch, client);
+```
+
+`maxAgeSeconds` is opt-in: when set, a document whose `lastUpdated` is older
+than that window (or that has no `lastUpdated`) is refused as stale.
+
 ## Legal
 
 Use of the hosted instance at agent402.tools is subject to its [Terms of Service](https://agent402.tools/terms) (acceptable-use policy included) and [Privacy Policy](https://agent402.tools/privacy). This package is MIT-licensed; the hosted server is AGPL-3.0. Both are provided as-is without warranty, and self-hosted deployments are their operator's responsibility.
