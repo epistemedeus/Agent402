@@ -19,8 +19,9 @@
 // a chain in one of these three shapes — 49 of them eip155:8453. The fixtures
 // below are the exact shapes of three of them, with addresses replaced.
 import "./lib/offline-stores.js"; // per-process and file backends whatever the caller exports (see the file)
+import { requestContractProjection } from "../src/request-contract.js";
 import { dispatchEligibility } from "../src/dispatch-eligibility.js";
-import { carryForwardLearnedQuotes, mergeManifestIntoTools, normaliseManifestTools, stampDeclared } from "../src/x402-index.js";
+import { carryForwardLearnedQuotes, mergeManifestIntoTools, normaliseManifestTools, normaliseOpenapiTools, stampDeclared } from "../src/x402-index.js";
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) pass++; else { fail++; console.error("FAIL:", m); } };
@@ -280,6 +281,139 @@ const PAYTO = "0x00000000000000000000000000000000000000aa";
     "items: an unusable catalogue leaves the single-resource fallback intact");
   ok(!normaliseManifestTools({ ...single, items: manifest.items }, origin).some((r) => r.route === "/single"),
     "items: a usable catalogue takes precedence over the single-resource fallback");
+}
+
+// A documented canonical URL is distinct from a fixed query product.
+{
+  const origin = "https://canonical.example";
+  const path = "/inspect";
+  const sample = "https://sample.example/fixture";
+  const url = `${origin}${path}?url=${encodeURIComponent(sample)}`;
+  const terms = { scheme: "exact", network: BASE, amount: "5000", asset: USDC, payTo: PAYTO };
+  const item = {
+    identity: { id: "inspect" },
+    resource: { url, routeTemplate: path },
+    request: {
+      url: origin + path, method: "GET", exampleUrl: url,
+      example: { type: "http", method: "GET", queryParams: { url: sample } },
+      schema: { type: "object", properties: {
+        type: { const: "http" }, method: { enum: ["GET", "HEAD"] },
+        queryParams: { type: "object", required: ["url"], properties: { url: { type: "string" }, limit: { type: "integer" } } },
+      }, required: ["type", "method"] },
+    },
+    accepts: [terms],
+  };
+  const manifest = (items, extra = {}) => ({ x402Version: 2, items, ...extra });
+  const openapi = () => normaliseOpenapiTools({
+    openapi: "3.1.0", paths: {
+      [path]: { get: { summary: "Inspect input", responses: { 200: { description: "OK" } } } },
+    },
+  }, origin);
+  const examples = new Map();
+  const rows = normaliseManifestTools(manifest([item]), origin, { examples });
+  const merged = mergeManifestIntoTools(rows, openapi());
+  ok(merged.length === 1 && merged[0].method === "GET" && merged[0].route === path
+    && merged[0].price === "$0.005" && merged[0].networks?.join() === BASE && merged[0].payToByNetwork?.[BASE] === PAYTO,
+    `canonical request: one priced Base operation after the actual OpenAPI merge (got ${JSON.stringify(merged.map((r) => [r.route.split("?")[0], r.route.includes("?"), r.networks || []]))})`);
+  const contract = requestContractProjection(merged[0]).requestContract;
+  ok(contract?.required?.query?.join() === "url" && contract?.optional?.query?.join() === "limit"
+    && contract.source === "seller_manifest" && contract.runtimeVerified === false,
+    "canonical request: project query schema names, not wrapper fields");
+  ok(examples.size === 1 && examples.get(`GET ${path}`) === new URL(url).search && !JSON.stringify(merged).includes("sample.example"),
+    "canonical request: the example is kept only under the exact GET probe key");
+
+  const mutate = (f) => { const copy = structuredClone(item); f(copy); return copy; };
+  const invalidPairs = [
+    (x) => { delete x.request.exampleUrl; },
+    (x) => { x.request.exampleUrl += "&limit=7"; },
+    (x) => { x.request.url = "https://foreign.example/inspect"; },
+    (x) => { x.request.url += "?url=foreign"; },
+    (x) => { x.resource.routeTemplate = "/elsewhere"; },
+    (x) => { x.request.example.method = "POST"; },
+    (x) => { x.request.schema.properties.method.enum = ["POST"]; },
+    (x) => { x.request.example.headers = { Authorization: "fixture" }; },
+    (x) => { x.request.schema.required.push("headers"); },
+    (x) => { x.request.example.queryParams.url = "https://other.example"; },
+    (x) => { x.request.example.queryParams.undocumented = true; },
+    (x) => { x.request.example.queryParams.url = 12; },
+    (x) => { x.resource.url += "&url=duplicate"; x.request.exampleUrl = x.resource.url; },
+    (x) => { x.request.schema.properties.queryParams.required.push("missing"); },
+    (x) => { x.request.schema.properties.queryParams.properties.url.const = sample; },
+    (x) => { x.request.schema.properties.queryParams.properties.url.enum = [sample]; },
+    (x) => { x.accepts.push({ ...terms, amount: "4000" }); },
+  ];
+  for (const change of invalidPairs) {
+    const bad = mutate(change);
+    const privateExamples = new Map();
+    const out = mergeManifestIntoTools(normaliseManifestTools(manifest([bad]), origin, { examples: privateExamples }), openapi());
+    ok(out.length === 2 && out[0].route === path && !out[0].networks?.length && privateExamples.size === 0,
+      "canonical request: an ambiguous pair leaves payment on its exact query route");
+  }
+  const variant = { resource: { url: origin + path + "?sku=premium" }, request: { method: "GET" }, accepts: [{ ...terms, amount: "10000" }] };
+  for (const items of [[item, variant], [item, item], [item, mutate((x) => { x.accepts[0].payTo = "0x" + "bb".repeat(20); })]]) {
+    const out = normaliseManifestTools(manifest(items), origin);
+    ok(out.length === new Set(items.map((r) => r.resource.url)).size
+      && out.every((r) => r.route.includes("?")), "canonical request: duplicate or competing SKUs stay exact");
+  }
+  const clipped = normaliseManifestTools(manifest([item, ...Array(999).fill(null), variant]), origin);
+  ok(clipped.length === 1 && clipped[0].route.includes("?"),
+    "canonical request: a truncated catalogue cannot establish a sole operation");
+  const sameId = { ...variant, identity: item.identity, resource: { url: origin + "/different" } };
+  ok(!normaliseManifestTools(manifest([item, sameId]), origin).some((r) => r.route === path),
+    "canonical request: a repeated published identity cannot promote terms");
+
+  const post = { resource: { url: origin + path }, request: { method: "POST" }, accepts: [{ ...terms, amount: "10000" }] };
+  const both = normaliseManifestTools(manifest([item, post]), origin);
+  ok(both.length === 2 && both.find((r) => r.method === "GET")?.price === "$0.005"
+    && both.find((r) => r.method === "POST")?.price === "$0.01", "canonical request: a POST sibling keeps its own terms");
+  const flatVariant = { resource: path + "?sku=flat", method: "GET", price: "$0.02" };
+  const flat = normaliseManifestTools(manifest([item], { resources: [flatVariant] }), origin);
+  ok(flat.length === 2 && flat.every((r) => r.route.includes("?")) && flat.some((r) => r.price === "$0.02"),
+    "canonical request: a flat fixed-query product also prevents broadening");
+  const flatConflict = normaliseManifestTools(manifest([item], {
+    resources: [{ resource: path, method: "GET", price: "$0.02" }],
+  }), origin);
+  ok(flatConflict.length === 2 && flatConflict.find((r) => r.route === path)?.price === "$0.02",
+    "canonical request: a conflicting flat canonical price keeps its own row");
+
+  for (const conflict of [
+    { price: "$0.02" }, { networks: ["eip155:137"] }, { payToByNetwork: { [BASE]: "0x" + "bb".repeat(20) } },
+    { paid: false }, { seller: "https://foreign.example" },
+  ]) {
+    const [observed] = openapi();
+    Object.assign(observed, conflict);
+    const [kept] = mergeManifestIntoTools(rows, [observed]);
+    ok(!kept.manifestCanonicalRequest && !kept.originDeclaredPrice && !kept.requestContract,
+      "canonical request: an incompatible observed row gains no sample, contract or origin price");
+  }
+  const [observed] = openapi();
+  const blocked = mergeManifestIntoTools(rows, [observed, { ...observed, route: path + "?sku=observed", price: "$0.03" }]);
+  ok(blocked.length === 2 && !blocked[0].networks?.length && blocked[1].price === "$0.03",
+    "canonical request: an observed fixed query product survives and blocks broadening");
+  const duplicates = mergeManifestIntoTools(rows, [observed, { ...observed }]);
+  ok(duplicates.length === 2 && duplicates.every((r) => !r.networks?.length),
+    "canonical request: duplicate observed operation rows cannot gain terms by inference");
+  const seenSchema = normaliseOpenapiTools({
+    openapi: "3.1.0", paths: { [path]: { get: { parameters: [{ in: "query", name: "target", required: true }], responses: { 200: { description: "OK" } } } } },
+  }, origin);
+  const [withSchema] = mergeManifestIntoTools(rows, seenSchema);
+  ok(requestContractProjection(withSchema).requestContract?.required?.query?.join() === "target",
+    "canonical request: a meaningful OpenAPI request contract keeps precedence");
+
+  const scopedPath = "/tenant" + path;
+  const scopedItem = mutate((x) => {
+    x.request.url = origin + scopedPath;
+    x.resource.url = x.request.exampleUrl = origin + scopedPath + new URL(url).search;
+    x.resource.routeTemplate = scopedPath;
+  });
+  const scopedExamples = new Map();
+  const scoped = normaliseManifestTools(manifest([scopedItem]), origin + "/tenant", { examples: scopedExamples });
+  ok(scoped.length === 1 && scoped[0].route === path && scopedExamples.has(`GET ${path}`),
+    "canonical request: the exact scoped operation receives its own probe key");
+  const outOfScope = structuredClone(scopedItem);
+  outOfScope.request.url = origin + path;
+  ok(normaliseManifestTools(manifest([outOfScope]), origin + "/tenant")[0]?.route.startsWith(path + "?"),
+    "canonical request: a sibling scope cannot supply the canonical URL");
 }
 
 console.log(`${pass} passed, ${fail} failed`);

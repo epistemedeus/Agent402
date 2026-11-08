@@ -453,6 +453,139 @@ try {
   ok(__probeExampleMemoStatsForTest().origins === before - 1, "removing an origin drops its examples from the memo");
 }
 
+// A cold crawl exposes a reusable operation to the router. The seller
+// validates GET inputs before challenging, and a changed input has its own 402.
+{
+  const { acceptsFromLive402 } = await import("../src/x402-live-quote.js");
+  const { buildRouteExecuteTool, EXEC_TIERS } = await import("../src/tools/route-execute.js");
+  const { Agent402 } = await import("../client/index.js");
+  const origin = "https://canonical.example";
+  const marker = "canonical-probe-only-8b61";
+  const base = "eip155:8453";
+  const terms = { scheme: "exact", network: base, amount: "5000",
+    asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", payTo: PAY_TO, maxTimeoutSeconds: 60 };
+  const operations = [
+    { path: "/extract", title: "canonicalextract", inputs: { url: `https://sample.example/${marker}` },
+      changed: { url: "https://changed.example/a?b=1" }, offer: terms },
+    { path: "/commerce/seller-integrity-audit", title: "canonicalaudit",
+      inputs: { origin: `https://${marker}.example`, route: "/example" },
+      changed: { origin: "https://changed.example", route: "/inspect" }, offer: { ...terms, amount: "10000" } },
+  ];
+  const routeResults = (query, network) => idx.routeQuery({
+    query, network, include: "external", top: 10, baseUrl: "https://router.example",
+    catalog: {}, prices: {}, toolCount: 0,
+  });
+  const received = [];
+  const local = await listen((req, res) => {
+    const url = new URL(req.url, origin);
+    if (url.pathname === "/api/route") {
+      const results = routeResults(url.searchParams.get("q"), url.searchParams.get("network"));
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(results));
+      return;
+    }
+    const operation = operations.find((op) => op.path === url.pathname);
+    const query = [...url.searchParams];
+    received.push({ method: req.method, path: url.pathname, query, headers: req.headers });
+    if (!operation || req.method !== "GET" || query.length !== Object.keys(operation.inputs).length
+      || !Object.keys(operation.inputs).every((key) => url.searchParams.getAll(key).length === 1)) {
+      res.writeHead(400).end();
+      return;
+    }
+    // The example intentionally advertises different terms. Its liveness
+    // probe must not seed a quote, chain or payee for buyer-chosen inputs.
+    const offer = url.search.includes(marker) ? arcAccept : operation.offer;
+    const envelope = { x402Version: 2, resource: { url: url.href }, accepts: [offer] };
+    res.writeHead(402, { "payment-required": Buffer.from(JSON.stringify(envelope)).toString("base64") }).end();
+  });
+  const transport = (url, opts = {}) => {
+    const u = new URL(url);
+    if (u.origin !== origin) throw new Error("probe left the disposable seller");
+    if (opts.method !== "GET") return Promise.resolve(new Response(null, { status: 405 }));
+    return fetch(local.origin + u.pathname + u.search, { ...opts, redirect: "manual" });
+  };
+  __setProbeFetchForTest(transport);
+  const toItem = (op) => {
+    const url = origin + op.path;
+    const exampleUrl = url + "?" + new URLSearchParams(op.inputs);
+    return {
+      resource: { url: exampleUrl, routeTemplate: op.path, serviceName: op.title },
+      request: { url, method: "GET", exampleUrl, example: { type: "http", method: "GET", queryParams: op.inputs },
+        schema: { type: "object", properties: {
+          queryParams: { type: "object", required: Object.keys(op.inputs),
+            properties: Object.fromEntries(Object.keys(op.inputs).map((key) => [key, { type: "string" }])) },
+        } },
+      },
+      accepts: [op.offer],
+    };
+  };
+  served.set(origin + "/.well-known/x402", { x402Version: 2, items: operations.map(toItem) });
+  served.set(origin + "/openapi.json", { openapi: "3.1.0", paths: Object.fromEntries(
+    [...operations, { path: "/bare", title: "canonicalbare" }].map(({ path, title }) => [
+      path, { get: { summary: title, responses: { 200: { description: "OK" } } } },
+    ])
+  ) });
+  const route = (query, network) => routeResults(query, network).results.find((row) => row.seller === origin);
+  const client = new Agent402({ baseUrl: local.origin, tlsDistrust: false });
+  try {
+    for (const op of operations) {
+      const empty = await transport(origin + op.path, { method: "GET" });
+      ok(empty.status === 400 && !empty.headers.has("payment-required"), "the canonical GET without input gives 400 before the paywall");
+    }
+    await __crawlSellerForTest(origin, { forcePaywall: true });
+    const detail = sellerDetail(origin);
+    ok(detail?.paywall?.status === 402 && detail.paywall.input === "manifest_example"
+      && detail.paywall.url === origin + "/extract"
+      && received.some((r) => r.path === "/extract" && r.query.some(([, v]) => v.includes(marker))),
+      "the real crawl paywall probe uses the bound GET example and reports the canonical URL");
+    ok(detail?.tools.filter((r) => r.route !== "/bare").length === 2
+      && detail.tools.filter((r) => r.route !== "/bare").every((r) => r.networks?.join() === base),
+      "the example 402 adds no live quote or chain to the canonical operation");
+    const bare = route("canonicalbare");
+    ok(bare?.route === "/bare" && !bare.networks?.length && !bare.networksInferred,
+      "exact item terms are excluded from seller-wide route fallback");
+
+    let challenge;
+    const execute = buildRouteExecuteTool({
+      getCatalog: () => ({}), externalEnabled: () => true, spendingWalletStatus: () => null,
+      tier: EXEC_TIERS.find((tier) => tier.slug === "route-execute-plus"),
+      resolveExternal: (task) => route(task, "base"),
+      // Stop at the normal execution handler's unsigned transport boundary.
+      payExternal: async (url, { method, body }) => {
+        if (body !== undefined) throw new Error("a GET must not carry a body");
+        const res = await transport(url, { method });
+        challenge = { status: res.status, accepts: acceptsFromLive402({ header: res.headers.get("payment-required") }) };
+        throw Object.assign(new Error("unsigned test stop"), { statusCode: 402, committed: false });
+      },
+    });
+    for (const op of operations) {
+      challenge = null;
+      const discovery = await client.route(op.title, { include: "external", network: "base" });
+      const plan = discovery.results.find((row) => row.seller === origin);
+      ok(plan?.url === origin + op.path && plan.method === "GET" && !plan.networksInferred
+        && plan.requestContract?.required?.query?.join() === Object.keys(op.inputs).join(),
+        "the normal discovery client receives the canonical URL and names needed for a new request");
+      if (!plan?.requestContract?.required?.query) continue;
+      const params = Object.fromEntries(plan.requestContract.required.query.map((name) => [name, op.changed[name]]));
+      try { await execute.handler({ task: op.title, include: "external", params }, {}); } catch (e) {
+        ok(e.message.includes("unsigned test stop") && !e.committed, "the normal execution handler reaches the unsigned transport stop");
+      }
+      const last = received.at(-1);
+      ok(challenge?.status === 402 && challenge.accepts?.[0]?.network === base
+        && challenge.accepts[0].amount === op.offer.amount && challenge.accepts[0].payTo === PAY_TO
+        && last.path === op.path && JSON.stringify(Object.fromEntries(last.query)) === JSON.stringify(op.changed)
+        && last.query.length === Object.keys(op.changed).length,
+        "a caller-chosen input gets an unsigned Base 402, with one query entry per field");
+    }
+    ok(received.every((r) => r.method === "GET" && !Object.keys(r.headers).some((h) => /^(payment|x-payment|authorization)/i.test(h))),
+      "every request to the disposable seller is an unsigned GET");
+    ok(!JSON.stringify(detail).includes(marker) && !JSON.stringify(route("canonicalextract", "base")).includes(marker)
+      && persistIndexCache(process.env.INDEX_CACHE_FILE) && !readFileSync(process.env.INDEX_CACHE_FILE, "utf8").includes(marker),
+      "the bound example value stays out of seller detail, route discovery and persistence");
+  } finally {
+    local.server.close();
+  }
+}
+
 __testSetBazaarTools(d.origin, null);
 __setProbeFetchForTest(null);
 __setCrawlFetchForTest(null);

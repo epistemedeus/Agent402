@@ -3201,7 +3201,7 @@ export function normaliseManifestTools(manifest, originUrl, { examples = null } 
       const ex = r && exampleOf.get(r);
       if (!ex) continue;
       const route = r[SCOPED_ROW] ? r.route : scopeRouteToSeller(originUrl, r.route);
-      if (route != null) noteProbeExample(examples, r.methodInferred ? null : r.method, route, ex);
+      if (route != null) noteProbeExample(examples, r.methodInferred ? null : r.method, route, ex, { exactOnly: r.manifestCanonicalRequest });
     }
   }
   return scopeRowsToSeller(rows, originUrl);
@@ -3234,12 +3234,72 @@ function manifestDeclaresPrefixedOrigin(manifest, originUrl) {
     return a.host === b.host && a.pathname.replace(/\/+$/, "") === b.pathname.replace(/\/+$/, "");
   } catch { return false; }
 }
-// Read v2 items separately from the legacy pathname metadata. Their accepts
-// describe the operation at resource.url and request.method alone.
-function manifestItemRows(manifest, originUrl) {
+// An explicit GET example can describe a parameterized operation. All three
+// URL declarations and every example value must agree before removing a query.
+function manifestGetExample(item, url, method) {
+  const req = item.request;
+  const canonical = url.origin + url.pathname;
+  if (method !== "GET" || (item.type != null && item.type !== "http")
+    || url.protocol !== "https:" || !url.search || URL_TEMPLATE_RE.test(url.pathname)
+    || req.url !== canonical || item.resource.routeTemplate !== url.pathname
+    || req.exampleUrl !== item.resource.url || req.exampleUrl !== canonical + url.search
+    || req.example?.type !== "http" || req.example.method !== method) return null;
+  const wrapper = req.schema;
+  const declaredMethod = wrapper?.properties?.method;
+  if ((declaredMethod?.const != null && declaredMethod.const !== method)
+    || (Array.isArray(declaredMethod?.enum) && !declaredMethod.enum.includes(method))) return null;
+  const fields = ["type", "method", "queryParams"];
+  if (Object.keys(req.example).some((key) => !fields.includes(key))
+    || (Array.isArray(wrapper?.required) && wrapper.required.some((key) => !fields.includes(key)))) return null;
+  const schema = wrapper?.properties?.queryParams;
+  const values = req.example.queryParams;
+  if (schema?.type !== "object" || !values || typeof values !== "object" || Array.isArray(values)) return null;
+  const contract = requestContractFromInputSchema(schema, method);
+  const required = contract.required.query;
+  if (contract.state !== "declared" || !required?.length
+    || required.length !== schema.required.length || !schema.required.every((key) => required.includes(key))) return null;
+  const names = new Set([...required, ...(contract.optional?.query || [])]);
+  const seen = new Set();
+  for (const [key, value] of url.searchParams) {
+    if (seen.has(key) || !names.has(key) || !Object.hasOwn(schema.properties || {}, key) || !Object.hasOwn(values, key)) return null;
+    const declared = values[key];
+    if (typeof declared !== "string" && typeof declared !== "boolean" && !Number.isFinite(declared)) return null;
+    const field = schema.properties[key];
+    if (field?.type !== typeof declared && !(field?.type === "integer" && Number.isInteger(declared))) return null;
+    // A fixed selector is itself evidence of a query-specific product.
+    if (Object.hasOwn(field, "const") || (Array.isArray(field.enum)
+      && (new Set(field.enum).size < 2 || !field.enum.includes(declared)))) return null;
+    if (value !== String(declared)) return null;
+    seen.add(key);
+  }
+  if (seen.size !== Object.keys(values).length || !required.every((key) => seen.has(key))) return null;
+  return { route: url.pathname, query: url.search, requestContract: packRequestContract(contract) };
+}
+
+function canonicalItemConflicts(hit, item) {
+  if (hit.paid === false || (hit.seller && hit.seller !== item.seller)) return true;
+  const itemPrice = priceToMicroUsd(item.price);
+  if ([hit.price, hit.originDeclaredPrice].some((price) => price != null && priceToMicroUsd(price) !== itemPrice)) return true;
+  if (hit.networks?.length && (hit.networks.length !== item.networks.length
+    || !hit.networks.every((net) => item.networks.includes(net)))) return true;
+  return Object.entries(hit.payToByNetwork || {}).some(([net, addr]) => addr !== item.payToByNetwork?.[net])
+    || (hit.stellarPayTo && hit.stellarPayTo !== item.stellarPayTo)
+    || (hit.algorandPayTo && hit.algorandPayTo !== item.algorandPayTo);
+}
+
+// Read v2 items separately from legacy pathname metadata. Their accepts stay
+// on the exact resource unless a sole, explicit canonical GET can be bound.
+function manifestItemRows(manifest, originUrl, pairs) {
   const rows = new Map();
   if (manifest.x402Version !== 2 || !Array.isArray(manifest.items)) return rows;
-  for (const item of manifest.items.slice(0, 1000)) {
+  const items = manifest.items.slice(0, 1000);
+  const paths = new Map();
+  const ids = new Map();
+  for (const item of items) {
+    const id = item?.identity?.id;
+    if (typeof id === "string" && id) ids.set(id, (ids.get(id) || 0) + 1);
+  }
+  for (const item of items) {
     const resource = item?.resource;
     const method = typeof item?.request?.method === "string" ? item.request.method.toUpperCase() : "";
     if (typeof resource?.url !== "string" || resource.url.length > 8192 || !MANIFEST_HTTP_METHODS.has(method)) continue;
@@ -3250,6 +3310,8 @@ function manifestItemRows(manifest, originUrl) {
     if (url.pathname === "/" || url.pathname.startsWith("//") || MANIFEST_NON_TOOL_PATH.test(url.pathname)) continue;
     const route = url.pathname + url.search;
     if (route.length > 8192) continue;
+    const pathKey = manifestRouteKey({ method, route: url.pathname });
+    paths.set(pathKey, (paths.get(pathKey) || 0) + 1);
     const key = manifestRouteKey({ method, route });
     if (rows.has(key) || !Array.isArray(item.accepts)) continue;
     const accepts = item.accepts.slice(0, 16).filter((a) =>
@@ -3280,7 +3342,13 @@ function manifestItemRows(manifest, originUrl) {
       // Retained across cache reloads so a later reprice stays on this verb.
       manifestExactItem: true,
     });
+    // Promotion requires an unambiguous item, including its complete accepts.
+    if (items.length !== manifest.items.length || ids.get(item?.identity?.id) > 1 || accepts.length !== item.accepts.length
+      || new Set(accepts.map((a) => a.network)).size !== accepts.length) continue;
+    const pair = manifestGetExample(item, url, method);
+    if (pair) pairs.set(key, pair);
   }
+  for (const [key, pair] of pairs) if (paths.get(`GET ${pair.route}`) !== 1) pairs.delete(key);
   return rows;
 }
 
@@ -3302,7 +3370,10 @@ function normaliseManifestToolsUnscoped(manifest, originUrl, exampleOf = null) {
     .filter((v) => Array.isArray(v) && v.length);
   const pathsCatalogue = manifestPathsCatalogue(manifest);
   if (pathsCatalogue) catalogues.push(pathsCatalogue);
-  const itemRows = manifestItemRows(manifest, originUrl);
+  const pairs = new Map();
+  const itemRows = manifestItemRows(manifest, originUrl, pairs);
+  if (pairs.size && (catalogues.some((list) => list.length > 1000)
+    || (pathsCatalogue && Object.keys(manifest.paths).length > 1000))) pairs.clear();
   const itemPrefix = itemRows.size && manifestDeclaresPrefixedOrigin(manifest, originUrl) ? sellerPrefixOf(originUrl) : "";
   if (!catalogues.length && !itemRows.size) {
     const single = singleResourceManifestTool(manifest, originUrl);
@@ -3430,6 +3501,25 @@ function normaliseManifestToolsUnscoped(manifest, originUrl, exampleOf = null) {
     }
   }
 
+  // A flat catalogue may independently offer a fixed query product. Keep
+  // both exact rows when a sibling variant or conflicting bare row exists.
+  const legacyVariants = new Set();
+  if (pairs.size) for (const r of byKey.values()) {
+    if (r.route.includes("?")) legacyVariants.add(manifestRouteKey({ method: r.method, route: pathOf(r.route) }));
+  }
+  const queriesByKey = exampleOf ? new Map() : null;
+  for (const [key, pair] of pairs) {
+    const item = itemRows.get(key);
+    const canonicalKey = `GET ${pair.route}`;
+    const legacy = byKey.get(canonicalKey);
+    if (legacyVariants.has(canonicalKey) || (legacy && canonicalItemConflicts(legacy, item))) continue;
+    itemRows.delete(key);
+    itemRows.set(canonicalKey, {
+      ...item, route: pair.route, requestContract: pair.requestContract, manifestCanonicalRequest: true,
+    });
+    if (queriesByKey) queriesByKey.set(canonicalKey, pair.query);
+  }
+
   // Path-level metadata from a rich object fills sibling methods discovered as
   // thin strings (GET+POST resource lines + one priced endpoints[] object).
   for (const [key, t] of byKey) {
@@ -3497,7 +3587,10 @@ function normaliseManifestToolsUnscoped(manifest, originUrl, exampleOf = null) {
       byKey.delete(k);
     }
   }
-  if (exampleByKey) for (const [k, t] of byKey) { const ex = exampleByKey.get(k); if (ex) exampleOf.set(t, ex); }
+  if (exampleByKey) for (const [k, t] of byKey) {
+    const ex = t.manifestCanonicalRequest ? queriesByKey.get(k) : exampleByKey.get(k);
+    if (ex) exampleOf.set(t, ex);
+  }
   return [...byKey.values()];
 }
 
@@ -3609,6 +3702,7 @@ export function dropUnvouchedNonProductRoutes(tools = [], vouchedRoutes = []) {
 }
 
 function enrichManifestToolRow(hit, m) {
+  if (m.manifestCanonicalRequest && canonicalItemConflicts(hit, m)) return;
   if (!hit.name || hit.name === hit.route || String(hit.name).startsWith("/")) hit.name = m.name || hit.name;
   if (!hit.description) hit.description = m.description || "";
   if ((!hit.slug || hit.slug === hit.route) && m.slug) hit.slug = m.slug;
@@ -3616,7 +3710,10 @@ function enrichManifestToolRow(hit, m) {
   // from a manifest schema.
   // A manifest's names also fill an OpenAPI "requires nothing": an operation
   // documented with no parameters says less than a schema listing fields.
-  if (requestContractStrength(m.requestContract) > requestContractStrength(hit.requestContract)) hit.requestContract = m.requestContract;
+  const existingContract = requestContractStrength(hit.requestContract);
+  if ((!m.manifestCanonicalRequest || existingContract < 2)
+    && requestContractStrength(m.requestContract) > existingContract) hit.requestContract = m.requestContract;
+  if (m.manifestCanonicalRequest) hit.manifestCanonicalRequest = true;
   if (m.manifestExactItem) {
     hit.manifestExactItem = true;
     delete hit.methodInferred;
@@ -3703,11 +3800,13 @@ export function mergeManifestIntoTools(manifestTools = [], existing = []) {
     groups.get(path).push(m);
   }
   const byExact = new Map();
+  const observedVariants = new Set();
   const indicesByPath = new Map();
   existing.forEach((t, i) => {
     const p = String(t.route || "").split("?")[0];
     if (!p) return;
     if (exactPaths.has(p)) {
+      if (t.route.includes("?")) observedVariants.add(manifestRouteKey({ method: t.method, route: p }));
       const key = manifestRouteKey(t);
       if (!byExact.has(key)) byExact.set(key, []);
       byExact.get(key).push(t);
@@ -3720,7 +3819,9 @@ export function mergeManifestIntoTools(manifestTools = [], existing = []) {
   const append = [];
   for (const m of manifestTools) {
     if (!exactPaths.has(pathOf(m.route))) continue;
-    const hits = byExact.get(manifestRouteKey(m));
+    const key = manifestRouteKey(m);
+    const hits = byExact.get(key);
+    if (m.manifestCanonicalRequest && (observedVariants.has(key) || hits?.length > 1)) continue;
     if (hits) {
       for (const hit of hits) enrichManifestToolRow(hit, m);
     } else {
@@ -5313,7 +5414,7 @@ export function isMppChallenge(wwwAuthHeaderValue) {
   return !!wwwAuthHeaderValue && /^Payment\b/i.test(String(wwwAuthHeaderValue).trim());
 }
 
-async function probePaywall(tools, { redirectedTo = null } = {}) {
+async function probePaywall(tools, { redirectedTo = null, probeExamples = null } = {}) {
   // A cached tool row has NO `url` field — the callable URL is derived as
   // seller + route, the same way routeQuery builds it (see the `url:` mapping
   // further down this file). The first version of this filtered on
@@ -5328,6 +5429,9 @@ async function probePaywall(tools, { redirectedTo = null } = {}) {
       // A manifest row's "$0.005" is a price; a sentence is not (price-usd.js).
       && isPricedAboveZero(t.price)
       && (!t.manifestExactItem || probeMethodsFor(t).length)
+      // An empty GET may fail input validation before reaching the paywall.
+      && (!t.manifestCanonicalRequest || (probeOriginOf(t.seller, redirectedTo) === t.seller
+        && probeExamples?.has(manifestRouteKey(t))))
       // A slow origin is probed with GET only: a POST would send a body to its
       // write routes (feedback, reviews) just to read a price.
       && !(isSlowOrigin(t.seller) && String(t.method || "GET").toUpperCase() !== "GET")
@@ -5344,9 +5448,14 @@ async function probePaywall(tools, { redirectedTo = null } = {}) {
   // Built from the origin the manifest was redirected to, when one is recorded:
   // a stored http origin whose seller answers over https would otherwise read
   // 301 here on every probe while its paywall is healthy.
-  const target = sellerRouteUrl(probeOriginOf(pick.seller, redirectedTo), pick.route);
+  const origin = probeOriginOf(pick.seller, redirectedTo);
+  const query = pick.manifestCanonicalRequest ? probeExamples.get(manifestRouteKey(pick)) : null;
+  // The example is used only for this liveness read. No quote terms or sample
+  // inputs are attributed to the canonical operation or stored in its row.
+  const target = sellerRouteUrl(origin, pick.route + (query || ""));
   if (!target) return null;
-  let url = target;
+  const exampleBasis = query ? { input: "manifest_example" } : {};
+  const publicUrl = query ? sellerRouteUrl(origin, pick.route) : null;
   try {
     // Same guard as the router's live probe: crawled URLs are external data and
     // could DNS-rebind between crawl and now, so validate then pin.
@@ -5356,7 +5465,7 @@ async function probePaywall(tools, { redirectedTo = null } = {}) {
       ...(method !== "GET" ? { body: "{}" } : {}),
     });
     const res = probed.res;
-    url = probed.url;
+    const url = publicUrl || probed.url;
     // 402 is the ONLY healthy answer for an unpaid call to a paid route. A 200
     // means the route is not actually paywalled; a 5xx means it is broken.
     //
@@ -5367,10 +5476,11 @@ async function probePaywall(tools, { redirectedTo = null } = {}) {
     // live-verified signal (we made the request and read the actual header),
     // never a claim inferred from a registry or a manifest field.
     const mpp = isMppChallenge(res.headers.get("www-authenticate"));
-    // `url` is the URL that answered, which is the upgraded one after a 301/308.
-    return { ok: res.status === 402, status: res.status, url, at: Date.now(), mpp };
+    // Keep sample values private. Ordinary probes report the URL that answered.
+    return { ok: res.status === 402, status: res.status, url, at: Date.now(), mpp, ...exampleBasis };
   } catch (e) {
-    return { ok: false, status: 0, url: e?.probedUrl || url, at: Date.now(), error: String(e?.message || e).slice(0, 120), mpp: false };
+    return { ok: false, status: 0, url: publicUrl || e?.probedUrl || target,
+      at: Date.now(), error: query ? "example_probe_failed" : String(e?.message || e).slice(0, 120), mpp: false, ...exampleBasis };
   }
 }
 
@@ -5991,12 +6101,10 @@ async function crawlSeller(originUrl, { deadlineAt = 0, forcePaywall = false } =
     tools = mergeOpenapiIntoBazaar(tools, bazaarToolsByOrigin.get(originUrl) || [], {
       allRoutes: openapiRoutes || [],
     });
-    // The manifest is folded in LAST and by pathname, so it can only add
-    // endpoints nobody else reported or enrich ones already known. It can
-    // never add a second row for an endpoint we already list — see
-    // mergeManifestIntoTools for the 16 -> 30 regression that proved why.
-    // The seller's published example requests, for this crawl's unpaid quote
-    // probes only: a local Map, never on a row or the cache entry, dropped when
+    // Fold the manifest in last: exact operations for v2 items and pathname
+    // compatibility for older catalogues (see mergeManifestIntoTools).
+    // The seller's examples for unpaid quote and paywall probes only: a local
+    // Map, never on a row or the cache entry, dropped when
     // this crawl returns (src/probe-example.js). Manifest first, then OpenAPI.
     const probeExamples = new Map();
     tools = mergeManifestIntoTools(normaliseManifestTools(manifest, originUrl, { examples: probeExamples }), tools);
@@ -6039,7 +6147,7 @@ async function crawlSeller(originUrl, { deadlineAt = 0, forcePaywall = false } =
       fallbackErrors: undefined,
       // Not this seller's turn: carry the last reading forward rather than
       // dropping it — null must mean "never probed", not "not probed today".
-      paywall: !pastDeadline() && paywallProbeTurn(prev, { force: forcePaywall }) ? await probePaywall(tools, { redirectedTo }) : (prev?.paywall ?? null),
+      paywall: !pastDeadline() && paywallProbeTurn(prev, { force: forcePaywall }) ? await probePaywall(tools, { redirectedTo, probeExamples }) : (prev?.paywall ?? null),
     });
   } catch (e) {
     // No /.well-known/x402 — two fallback surfaces, richest metadata wins:
@@ -9558,14 +9666,17 @@ function decorationContext(v) {
   // signs, so an inferred chain the route does not actually offer fails the
   // buy with nothing spent - inference only decides who gets tried.
   const sellerOrigin = (v.tools || [])[0]?.seller || null;
-  const sellerNets = [...new Set([
-    ...(v.tools || []).flatMap((t) => t.networks || []),
-    ...(sellerOrigin ? (bazaarToolsByOrigin.get(sellerOrigin) || []) : []).flatMap((t) => t.networks || []),
-  ])];
+  // A v2 item is a declaration for an exact operation and cannot supply
+  // seller-wide defaults to a sibling that has no terms of its own.
+  const fallbackRows = [
+    ...(v.tools || []).filter((t) => !t.manifestExactItem),
+    ...(sellerOrigin ? (bazaarToolsByOrigin.get(sellerOrigin) || []) : []),
+  ];
+  const sellerNets = [...new Set(fallbackRows.flatMap((t) => t.networks || []))];
   // Same inheritance for the advertised EIP-712 domain: a row that observed
   // no accepts of its own reads the seller's (a wrong name is set once, in the
   // seller's middleware, so every route on the origin carries it).
-  const sellerDomains = evmDomainUnion([...(v.tools || []), ...(sellerOrigin ? (bazaarToolsByOrigin.get(sellerOrigin) || []) : [])]);
+  const sellerDomains = evmDomainUnion(fallbackRows);
   // The seller's own homepage and name are served the way /api/index serves
   // them: only an http(s) homepage is a link, and the name is cleaned, capped
   // and replaced by the bare host when it trips the listing screen.

@@ -25,10 +25,9 @@
 // tiny charset, so an allowlist bounds them structurally rather than by
 // pattern-matching what an attacker chose to write.
 //
-// The one private use of a sample is the unpaid quote probe: a seller's own
-// example request may be sent, bounded, as the probe body to that seller's own
-// route (src/probe-example.js, probeAttemptsFor). It is held only for that
-// crawl and never stored or projected; this file still projects no sample.
+// An unpaid probe can use a bounded seller example on its own route. The
+// probe memo is memory-only (src/probe-example.js); this file projects no
+// sample values.
 
 // The composed-schema refusal is response-contract.js's own scan and keyword
 // set, so the two contracts refuse exactly the same constructs.

@@ -1,5 +1,5 @@
-// The seller's own published example request, used as the body of ONE unpaid
-// quote probe to that seller's own route, and for nothing else.
+// The seller's own published example request, used only for an unpaid probe
+// of that seller's own route: a POST quote body or a bound GET paywall query.
 //
 // A POST route that validates its body before its paywall answers the bare
 // `{}` probe (and the name-shaped placeholders of probeBodyFor) with a 400, so
@@ -141,9 +141,9 @@ function addCounted(map, counts, k, v) {
 /** Record one example under its route. First writer wins, so a seller's own
  *  manifest (read first) is preferred over its OpenAPI. Keys are
  *  "<METHOD> <route>", plus "* <route>" for an entry that names no verb; each
- *  is recorded under the exact route and under its normalized path. At most
- *  MAX_EXAMPLES examples (routes) are kept. */
-export function noteProbeExample(map, method, route, text) {
+ *  is recorded under the exact route and, unless exactOnly, its normalized
+ *  path. At most MAX_EXAMPLES examples (routes) are kept. */
+export function noteProbeExample(map, method, route, text, { exactOnly = false } = {}) {
   if (!(map instanceof Map) || !text || typeof route !== "string" || !route || route.startsWith("~")) return;
   const m = method ? String(method).toUpperCase() : "*";
   const exact = `${m} ${route}`;
@@ -151,7 +151,7 @@ export function noteProbeExample(map, method, route, text) {
   // A route past the cap is not recorded at all, alias included.
   if (!map.has(exact) && counts.route >= MAX_EXAMPLES) return;
   addCounted(map, counts, exact, text);
-  addCounted(map, counts, `${m} ~${probeExamplePath(route)}`, text);
+  if (!exactOnly) addCounted(map, counts, `${m} ~${probeExamplePath(route)}`, text);
 }
 
 /** The example for a probe of `route` on `method`, or null: the exact route
