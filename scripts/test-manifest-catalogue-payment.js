@@ -19,7 +19,8 @@
 // a chain in one of these three shapes — 49 of them eip155:8453. The fixtures
 // below are the exact shapes of three of them, with addresses replaced.
 import "./lib/offline-stores.js"; // per-process and file backends whatever the caller exports (see the file)
-import { normaliseManifestTools } from "../src/x402-index.js";
+import { dispatchEligibility } from "../src/dispatch-eligibility.js";
+import { carryForwardLearnedQuotes, mergeManifestIntoTools, normaliseManifestTools, stampDeclared } from "../src/x402-index.js";
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) pass++; else { fail++; console.error("FAIL:", m); } };
@@ -151,6 +152,134 @@ const PAYTO = "0x00000000000000000000000000000000000000aa";
   ok(rows.length === 1 && (rows[0].networks || []).includes("eip155:8453"), `a paths entry with parameters is read (${rows.length} rows)`);
   const oa = normaliseManifestTools({ paths: { "/q": { get: { responses: {} }, parameters: [] } } }, "https://seller.example");
   ok(oa.every((r) => !(r.networks || []).length), "an OpenAPI path item keyed by verb is not read as a paths entry");
+}
+
+// An x402 v2 items catalogue describes each paid operation separately.
+{
+  const origin = "https://items.example";
+  const get = "/extract?url=https%3A%2F%2Fexample.com";
+  const post = "/extract/batch";
+  const audit = "/commerce/seller-integrity-audit?method=GET&route=%2Fpreflight";
+  const accept = { scheme: "exact", network: BASE, asset: USDC, amount: "5000", payTo: PAYTO };
+  const entry = (route, method, terms = [accept]) => ({
+    type: "http",
+    resource: { url: `${origin}${route}`, description: "Describe the operation.", serviceName: "Example API" },
+    request: { method },
+    accepts: terms,
+  });
+  const manifest = { x402Version: 2, items: [
+    entry(get, "GET"), entry(post, "POST", [{ ...accept, amount: "10000" }]),
+    entry(audit, "GET", [{ ...accept, amount: "10000" }]),
+  ] };
+  const rows = normaliseManifestTools(manifest, origin);
+  const summary = (list) => list.map((r) => [r.method, r.route, r.price, r.networks, r.payToByNetwork?.[BASE]]);
+  const expected = [
+    ["GET", get, "$0.005", [BASE], PAYTO],
+    ["POST", post, "$0.01", [BASE], PAYTO],
+    ["GET", audit, "$0.01", [BASE], PAYTO],
+  ];
+  ok(JSON.stringify(summary(rows)) === JSON.stringify(expected),
+    `items: expected exact Base GET and POST declarations, got ${JSON.stringify(summary(rows))}`);
+  ok(rows.length === 3 && rows.every((r) => r.provenance === "manifest" && !r.methodInferred
+    && !r.quality && !r.quoteSource && !r.networksVerifiedAt && r.originDeclaredPrice === Number(r.price.slice(1))),
+    "items: explicit verb and origin price without registry or live evidence");
+  const dispatch = rows[0] && dispatchEligibility({ routable: true, networks: rows[0].networks, priceUsd: 0.005 });
+  ok(dispatch?.reason === "settlement_required" && dispatch.eligible === false && dispatch.basis.settled === 0,
+    "items: an advertised Base price adds no settlement evidence");
+
+  const other = "eip155:137";
+  const unknown = "eip155:999999";
+  const otherPayTo = "0x00000000000000000000000000000000000000bb";
+  const unknownAsset = "0x00000000000000000000000000000000000000cc";
+  const variant = "/extract?url=https%3A%2F%2Fexample.net";
+  const variants = normaliseManifestTools({ ...manifest, items: [
+    entry(get, "GET"),
+    entry(get, "POST", [{ ...accept, network: unknown, asset: unknownAsset, payTo: otherPayTo }]),
+    entry(variant, "GET", [{ ...accept, network: other, asset: "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", amount: "9000", payTo: otherPayTo }]),
+    entry(get, "GET", [{ ...accept, network: other, payTo: otherPayTo, amount: "4000" }]),
+  ] }, origin);
+  ok(variants.length === 3 && variants[0]?.price === "$0.005" && variants[0]?.networks?.join() === BASE
+    && variants[0]?.payToByNetwork?.[BASE] === PAYTO,
+    "items: first valid duplicate owns the exact key");
+  ok(variants[1]?.price === null && variants[1]?.networks?.join() === unknown && variants[1]?.payToByNetwork?.[unknown] === otherPayTo
+    && !variants[1]?.payToByNetwork?.[BASE], "items: an unknown chain and asset gain neither Base nor its price");
+  ok(variants[2]?.route === variant && variants[2]?.price === "$0.009" && variants[2]?.networks?.join() === other
+    && variants[2]?.payToByNetwork?.[other] === otherPayTo, "items: the query variant keeps its own terms");
+
+  const invalid = [
+    null, {}, entry("/bad-method", "BREW"), entry("/array-method", ["GET"]), entry("/missing-method", undefined),
+    entry("/missing-accepts", "POST", null), entry("/empty-accepts", "GET", []),
+    entry("/object-network", "GET", [{ ...accept, network: {} }]),
+    entry("/unqualified-network", "GET", [{ ...accept, network: "not-a-chain" }]),
+    entry("/bad-payto", "GET", [{ ...accept, payTo: "not-an-address" }]),
+    entry("/bad-asset", "GET", [{ ...accept, asset: "not-a-contract" }]),
+    entry("/fraction", "GET", [{ ...accept, amount: "0.005" }]),
+    entry("/exponent", "GET", [{ ...accept, amount: "5e3" }]),
+    entry("/overflow", "GET", [{ ...accept, amount: "9007199254740992" }]),
+    entry("/conflicting-amounts", "GET", [{ ...accept, maxAmountRequired: "9999" }]),
+    entry(`/oversize?q=${"a".repeat(8192)}`, "GET"),
+    entry("/unsupported-scheme", "GET", [{ ...accept, scheme: "upto" }]),
+    { ...entry("/bad-url", "GET"), resource: { url: {} } },
+    ...["https://other.example/a", "http://items.example/a", "https://items.example:8080/a",
+      "https://user@items.example/a", "https://items.example//other.example/a"].map((url) => ({
+      ...entry("/bad-url", "GET"), resource: { url },
+    })),
+  ];
+  ok(normaliseManifestTools({ ...manifest, payment: { network: BASE, payTo: PAYTO }, items: invalid }, origin).length === 0,
+    "items: malformed rows, malformed terms and out-of-origin URLs are refused without a service-wide fallback");
+  ok(normaliseManifestTools({ ...manifest, items: Array(1000).fill(null).concat(manifest.items) }, origin).length === 0,
+    "items: the first 1,000 entries bound the catalogue");
+  const badAccept = { ...accept, amount: "not-an-integer" };
+  ok(normaliseManifestTools({ ...manifest, items: [
+    entry("/too-many", "GET", Array(16).fill(badAccept).concat(accept)),
+    entry("/partially-valid", "GET", [badAccept, accept]),
+  ] }, origin).map((r) => r.route).join() === "/partially-valid",
+  "items: invalid accepts are ignored and only the first 16 are examined");
+  const scoped = normaliseManifestTools({ ...manifest, items: [entry("/scope/x?q=1", "GET"), entry("/scope-other/x", "GET")] }, `${origin}/scope`);
+  ok(scoped.length === 1 && scoped[0].route === "/x?q=1", "items: scope is enforced at the seller's path boundary");
+  const scopedCollision = normaliseManifestTools({
+    ...manifest, origin: `${origin}/scope`, resources: ["/x?q=1"],
+    items: [entry("/scope/x?q=1", "GET")],
+  }, `${origin}/scope`);
+  ok(scopedCollision.length === 1 && scopedCollision[0].price === "$0.005",
+    "items: a re-anchored flat route collides on its final exact key");
+
+  const mixed = normaliseManifestTools({ ...manifest, resources: [
+    get, { resource: get, method: "POST" }, { resource: "/extract", method: "GET" },
+    { resource: post, method: "POST", price: "$0.02" },
+  ] }, origin);
+  const mixedGet = mixed.find((r) => r.route === get && r.method === "GET");
+  const mixedPost = mixed.find((r) => r.route === post && r.method === "POST");
+  ok(mixed.length === 5 && mixedGet?.price === "$0.005" && !mixedGet.methodInferred
+    && mixedPost?.price === "$0.02" && mixedPost?.networks?.join() === BASE,
+    "items: exact collisions fill blanks, preserve an existing explicit price, and replace an inferred verb");
+  ok(mixed.filter((r) => (r.method === "POST" && r.route === get) || r.route === "/extract")
+    .every((r) => !r.price && !r.networks?.length && !r.payToByNetwork?.[BASE]),
+    "items: a flat sibling method or query does not inherit item payment");
+
+  const observed = [
+    { method: "GET", route: get, price: 0.004, networks: [BASE], payToByNetwork: { [BASE]: otherPayTo }, quoteSource: "live-402" },
+    { method: "POST", route: get, price: null },
+    { method: "GET", route: "/extract", price: null },
+    { method: "POST", route: post, price: null },
+  ];
+  const merged = mergeManifestIntoTools(rows, observed);
+  stampDeclared(merged, rows);
+  ok(merged.length === 5 && merged[0].price === 0.004 && merged[0].payToByNetwork[BASE] === otherPayTo
+    && merged[3].price === "$0.01" && merged[3].payToByNetwork?.[BASE] === PAYTO && merged[3].declared,
+    "items: exact OpenAPI or registry collisions enrich in place and preserve an observed quote");
+  ok([merged[1], merged[2]].every((r) => r.declared === false && r.price === null && !r.networks?.length && !r.payToByNetwork?.[BASE]),
+    "items: the crawl merge does not enrich or declare a different method or query");
+  const exactPost = variants[1];
+  if (exactPost) carryForwardLearnedQuotes([exactPost], { tools: [{ ...observed[0], quoteObservedAt: Date.now() }] });
+  ok(exactPost?.price === null && exactPost?.method === "POST" && exactPost?.networks?.join() === unknown
+    && !exactPost?.payToByNetwork?.[BASE], "items: a remembered GET quote cannot price or rechain a POST");
+
+  const single = { x402Version: 2, resource: { url: `${origin}/single` }, accepts: [accept] };
+  ok(normaliseManifestTools({ ...single, items: invalid }, origin)[0]?.route === "/single",
+    "items: an unusable catalogue leaves the single-resource fallback intact");
+  ok(!normaliseManifestTools({ ...single, items: manifest.items }, origin).some((r) => r.route === "/single"),
+    "items: a usable catalogue takes precedence over the single-resource fallback");
 }
 
 console.log(`${pass} passed, ${fail} failed`);

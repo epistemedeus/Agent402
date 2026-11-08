@@ -5,12 +5,12 @@
 // corrected the declared GET row to POST and left two identical POST rows on
 // the path; before 2026-09-02 it published the GET and buyers got 405. Now the
 // refused declared row is dropped and its sibling carries the quote. Offline:
-// fetch is stubbed; example.com resolves publicly so the SSRF guard is happy.
+// the unpaid probe transport is stubbed.
 import "./lib/offline-stores.js"; // per-process and file backends whatever the caller exports (see the file)
 import assert from "node:assert/strict";
 
 process.env.X402_INDEX_CRAWL = "off";
-const { enrichLiveQuotes } = await import("../src/x402-index.js");
+const { __setProbeFetchForTest, enrichLiveQuotes, normaliseManifestTools } = await import("../src/x402-index.js");
 
 let n = 0;
 const ok = (c, m) => { n++; assert.ok(c, m); };
@@ -19,7 +19,6 @@ const eq = (a, b, m) => { n++; assert.equal(a, b, m); };
 const ORIGIN = "https://example.com";
 const accepts = { x402Version: 2, accepts: [{ scheme: "exact", network: "eip155:8453", payTo: "0x9fb365E4E9385E2a39FeBAd70368267e6f571d9A", amount: "500000", asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", maxTimeoutSeconds: 300, extra: { name: "USD Coin", version: "2", decimals: 6 } }] };
 const header = Buffer.from(JSON.stringify(accepts)).toString("base64");
-const orig = globalThis.fetch;
 const seen = [];
 const stub = (rules) => async (url, init = {}) => {
   const u = new URL(String(url)); const m = String(init.method || "GET").toUpperCase();
@@ -33,7 +32,7 @@ const origLog = console.log; console.log = (...a) => { logs.push(a.join(" ")); }
 
 try {
   // --- 1. declared GET refused (405), declared POST answers: the GET row is dropped, the POST row carries the quote
-  globalThis.fetch = stub({ "GET /x402/gas": 405, "POST /x402/gas": 402 });
+  __setProbeFetchForTest(stub({ "GET /x402/gas": 405, "POST /x402/gas": 402 }));
   const tools = [
     { seller: "example.com", route: "/x402/gas", method: "GET", slug: "x402_gas_get", networks: [] },
     { seller: "example.com", route: "/x402/gas", method: "POST", slug: "x402_gas_post", networks: [] },
@@ -52,7 +51,7 @@ try {
   // stays exactly as it was and only the POST row takes the read. Until
   // 2026-09-28 any non-402 on the stated verb dropped it.
   seen.length = 0; logs.length = 0;
-  globalThis.fetch = stub({ "GET /x402/check": 400, "POST /x402/check": 402 });
+  __setProbeFetchForTest(stub({ "GET /x402/check": 400, "POST /x402/check": 402 }));
   const validates = [
     { seller: "example.com", route: "/x402/check", method: "GET", slug: "x402_check_get", price: 0.01, originDeclaredPrice: 0.01, networks: ["eip155:10"] },
     { seller: "example.com", route: "/x402/check", method: "POST", slug: "x402_check_post", networks: [] },
@@ -68,7 +67,7 @@ try {
 
   // --- 2. control: the seller honours both verbs -> both rows stay, both priced
   seen.length = 0; logs.length = 0;
-  globalThis.fetch = stub({ "GET /x402/time": 402, "POST /x402/time": 402 });
+  __setProbeFetchForTest(stub({ "GET /x402/time": 402, "POST /x402/time": 402 }));
   const both = [
     { seller: "example.com", route: "/x402/time", method: "GET", slug: "x402_time_get", networks: [] },
     { seller: "example.com", route: "/x402/time", method: "POST", slug: "x402_time_post", networks: [] },
@@ -80,7 +79,7 @@ try {
 
   // --- 3. a lone declared GET that 405s with no sibling is CORRECTED (today's behaviour), never dropped
   seen.length = 0; logs.length = 0;
-  globalThis.fetch = stub({ "GET /only-post": 405, "POST /only-post": 402 });
+  __setProbeFetchForTest(stub({ "GET /only-post": 405, "POST /only-post": 402 }));
   const lone = [{ seller: "example.com", route: "/only-post", method: "GET", slug: "only_post", networks: [] }];
   await enrichLiveQuotes(lone, ORIGIN, { ignoreBudget: true });
   eq(lone.length, 1, "lone row kept");
@@ -90,14 +89,32 @@ try {
   eq(lone[0].networksVerifiedMethod, "POST", "the corrected row's stamp names the verb that answered, which is now its own");
 
   // --- 4. the drop is IN PLACE: a caller that ignores the return value sees it too
-  globalThis.fetch = stub({ "GET /x402/recall": 405, "POST /x402/recall": 402 });
+  __setProbeFetchForTest(stub({ "GET /x402/recall": 405, "POST /x402/recall": 402 }));
   const arr = [
     { seller: "example.com", route: "/x402/recall", method: "GET", slug: "x402_recall_get", networks: [] },
     { seller: "example.com", route: "/x402/recall", method: "POST", slug: "x402_recall_post", networks: [] },
   ];
   const ret = await enrichLiveQuotes(arr, ORIGIN, { ignoreBudget: true });
   ok(ret === arr && arr.length === 1, "the array passed in is the array trimmed (two call sites read it, not the return)");
+  // A v2 item declares an exact method. Even after reload, a refused GET
+  // must not borrow a POST quote or be relabelled as that operation.
+  seen.length = 0;
+  __setProbeFetchForTest(stub({ "GET /exact-item": 405, "POST /exact-item": 402 }));
+  const itemRows = normaliseManifestTools({ x402Version: 2, items: [{
+    resource: { url: `${ORIGIN}/exact-item?q=1` },
+    request: { method: "GET" },
+    accepts: [{
+      ...accepts.accepts[0],
+      network: "eip155:999999", asset: "0x00000000000000000000000000000000000000cc",
+      payTo: "0x00000000000000000000000000000000000000aa", extra: {},
+    }],
+  }] }, ORIGIN);
+  const reloaded = JSON.parse(JSON.stringify(itemRows));
+  await enrichLiveQuotes(reloaded, ORIGIN, { ignoreBudget: true });
+  eq(seen.join(), "GET /exact-item", "an exact GET item never probes its POST sibling");
+  eq(reloaded[0]?.method, "GET", "the item's declaration stays on GET");
+  eq(reloaded[0]?.price, null, "the item takes no price from a refused probe");
 } finally {
-  globalThis.fetch = orig; console.log = origLog;
+  __setProbeFetchForTest(); console.log = origLog;
 }
 console.log(`test-live-quote-method-refused: ${n} assertions ok`);

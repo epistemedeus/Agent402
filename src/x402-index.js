@@ -978,8 +978,13 @@ export function listingBasisProjection(t) {
 export function stampDeclared(tools, declaredRoutes = []) {
   if (!Array.isArray(tools)) return tools;
   const exact = new Set();
+  const operations = new Set();
   const templates = [];
   for (const d of declaredRoutes || []) {
+    if (d?.manifestExactItem) {
+      operations.add(manifestRouteKey(d));
+      continue;
+    }
     const r = pathOf(d?.route);
     if (!r) continue;
     exact.add(r);
@@ -989,7 +994,7 @@ export function stampDeclared(tools, declaredRoutes = []) {
   for (const t of tools) {
     if (!t || typeof t.route !== "string") continue;
     const r = pathOf(t.route);
-    t.declared = exact.has(r) || !templatesMatching(index, r).next().done;
+    t.declared = operations.has(manifestRouteKey(t)) || exact.has(r) || !templatesMatching(index, r).next().done;
   }
   return tools;
 }
@@ -2855,6 +2860,7 @@ const MANIFEST_HTTP_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE", 
 
 // Marks a manifest row whose ref was written host-relative (no scheme or host).
 const MANIFEST_HOST_RELATIVE = Symbol("manifestHostRelativeRef");
+const manifestRouteKey = (r) => `${String(r.method || "GET").toUpperCase()} ${r.route}`;
 
 function manifestToolRichness(t) {
   if (!t) return 0;
@@ -3228,6 +3234,56 @@ function manifestDeclaresPrefixedOrigin(manifest, originUrl) {
     return a.host === b.host && a.pathname.replace(/\/+$/, "") === b.pathname.replace(/\/+$/, "");
   } catch { return false; }
 }
+// Read v2 items separately from the legacy pathname metadata. Their accepts
+// describe the operation at resource.url and request.method alone.
+function manifestItemRows(manifest, originUrl) {
+  const rows = new Map();
+  if (manifest.x402Version !== 2 || !Array.isArray(manifest.items)) return rows;
+  for (const item of manifest.items.slice(0, 1000)) {
+    const resource = item?.resource;
+    const method = typeof item?.request?.method === "string" ? item.request.method.toUpperCase() : "";
+    if (typeof resource?.url !== "string" || resource.url.length > 8192 || !MANIFEST_HTTP_METHODS.has(method)) continue;
+    let url;
+    try { url = new URL(resource.url); } catch { continue; }
+    if (url.username || url.password || url.hash || !isUnderSeller(url.href, originUrl)) continue;
+    if (scopeRouteToSeller(originUrl, url.pathname)?.startsWith("//")) continue;
+    if (url.pathname === "/" || url.pathname.startsWith("//") || MANIFEST_NON_TOOL_PATH.test(url.pathname)) continue;
+    const route = url.pathname + url.search;
+    if (route.length > 8192) continue;
+    const key = manifestRouteKey({ method, route });
+    if (rows.has(key) || !Array.isArray(item.accepts)) continue;
+    const accepts = item.accepts.slice(0, 16).filter((a) =>
+      a?.scheme === "exact"
+      && typeof a.network === "string" && /^[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}$/.test(a.network)
+      && typeof a.asset === "string" && /^\S{1,128}$/.test(a.asset)
+      && (!a.network.startsWith("eip155:") || payToFitsNetwork(a.network, a.asset))
+      && typeof a.payTo === "string" && /^\S{1,128}$/.test(a.payTo) && payToFitsNetwork(a.network, a.payTo)
+      && typeof a.amount === "string" && /^\d{1,16}$/.test(a.amount) && Number.isSafeInteger(Number(a.amount))
+      && (a.maxAmountRequired == null || a.maxAmountRequired === a.amount)
+    );
+    if (!accepts.length) continue;
+    const pay = paymentFieldsFromAccepts(accepts);
+    const micro = priceToMicroUsd(pay.price);
+    const name = typeof resource.serviceName === "string" ? resource.serviceName.trim().slice(0, 200) : "";
+    rows.set(key, {
+      ...pay,
+      seller: originUrl,
+      method,
+      route,
+      slug: cleanListingSlug(url.pathname.slice(1).replace(/\//g, "-")),
+      name: name || url.pathname,
+      description: typeof resource.description === "string" ? resource.description.trim().slice(0, 400) : "",
+      category: "other",
+      tags: [],
+      price: Number.isSafeInteger(micro) && (micro > 0 || pay.price === 0) ? `$${microUsdToPrice(micro)}` : null,
+      provenance: "manifest",
+      // Retained across cache reloads so a later reprice stays on this verb.
+      manifestExactItem: true,
+    });
+  }
+  return rows;
+}
+
 function normaliseManifestToolsUnscoped(manifest, originUrl, exampleOf = null) {
   if (!manifest || typeof manifest !== "object") return [];
   let origin;
@@ -3246,7 +3302,9 @@ function normaliseManifestToolsUnscoped(manifest, originUrl, exampleOf = null) {
     .filter((v) => Array.isArray(v) && v.length);
   const pathsCatalogue = manifestPathsCatalogue(manifest);
   if (pathsCatalogue) catalogues.push(pathsCatalogue);
-  if (!catalogues.length) {
+  const itemRows = manifestItemRows(manifest, originUrl);
+  const itemPrefix = itemRows.size && manifestDeclaresPrefixedOrigin(manifest, originUrl) ? sellerPrefixOf(originUrl) : "";
+  if (!catalogues.length && !itemRows.size) {
     const single = singleResourceManifestTool(manifest, originUrl);
     return single ? [single] : [];
   }
@@ -3324,7 +3382,10 @@ function normaliseManifestToolsUnscoped(manifest, originUrl, exampleOf = null) {
       let u;
       try { u = new URL(ref, origin); } catch { continue; }
       if (u.host.toLowerCase() !== origin.host.toLowerCase()) continue;
-      const route = u.pathname + (u.search || "");
+      let route = u.pathname + (u.search || "");
+      if (itemPrefix && ref.startsWith("/") && !ref.startsWith("//") && scopeRouteToSeller(originUrl, route) == null) {
+        route = itemPrefix + route;
+      }
       if (!u.pathname || u.pathname === "/" || MANIFEST_NON_TOOL_PATH.test(u.pathname)) continue;
       const pathOnly = u.pathname;
       const slug = cleanListingSlug(name) || u.pathname.replace(/^\//, "").replace(/\//g, "-");
@@ -3371,7 +3432,8 @@ function normaliseManifestToolsUnscoped(manifest, originUrl, exampleOf = null) {
 
   // Path-level metadata from a rich object fills sibling methods discovered as
   // thin strings (GET+POST resource lines + one priced endpoints[] object).
-  for (const t of byKey.values()) {
+  for (const [key, t] of byKey) {
+    if (itemRows.has(key)) continue;
     const meta = metaByPath.get(String(t.route || "").split("?")[0]);
     if (!meta) continue;
     if (!t.price && meta.price) t.price = meta.price;
@@ -3387,6 +3449,14 @@ function normaliseManifestToolsUnscoped(manifest, originUrl, exampleOf = null) {
       if (!t.stellarPayTo && meta.pay.stellarPayTo) t.stellarPayTo = meta.pay.stellarPayTo;
       if (!t.algorandPayTo && meta.pay.algorandPayTo) t.algorandPayTo = meta.pay.algorandPayTo;
       if (!t.evmDomainByNetwork && meta.pay.evmDomainByNetwork) t.evmDomainByNetwork = meta.pay.evmDomainByNetwork;
+    }
+  }
+  for (const [key, item] of itemRows) {
+    const row = byKey.get(key);
+    if (row) {
+      enrichManifestToolRow(row, item);
+    } else {
+      byKey.set(key, item);
     }
   }
   // A price in the seller's OWN manifest is an origin declaration, exactly like
@@ -3423,7 +3493,7 @@ function normaliseManifestToolsUnscoped(manifest, originUrl, exampleOf = null) {
       // The dropped row's probe example moves to the declared rows on its
       // route that publish none, so the example survives the key change.
       const ex = exampleByKey && exampleByKey.get(k);
-      if (ex) for (const [dk, d] of byKey) if (!d.methodInferred && String(d.route) === String(t.route) && !exampleByKey.has(dk)) exampleByKey.set(dk, ex);
+      if (ex) for (const [dk, d] of byKey) if (!d.manifestExactItem && !d.methodInferred && String(d.route) === String(t.route) && !exampleByKey.has(dk)) exampleByKey.set(dk, ex);
       byKey.delete(k);
     }
   }
@@ -3538,6 +3608,57 @@ export function dropUnvouchedNonProductRoutes(tools = [], vouchedRoutes = []) {
   });
 }
 
+function enrichManifestToolRow(hit, m) {
+  if (!hit.name || hit.name === hit.route || String(hit.name).startsWith("/")) hit.name = m.name || hit.name;
+  if (!hit.description) hit.description = m.description || "";
+  if ((!hit.slug || hit.slug === hit.route) && m.slug) hit.slug = m.slug;
+  // Blank-fill: a contract read from the seller's OpenAPI outranks one read
+  // from a manifest schema.
+  // A manifest's names also fill an OpenAPI "requires nothing": an operation
+  // documented with no parameters says less than a schema listing fields.
+  if (requestContractStrength(m.requestContract) > requestContractStrength(hit.requestContract)) hit.requestContract = m.requestContract;
+  if (m.manifestExactItem) {
+    hit.manifestExactItem = true;
+    delete hit.methodInferred;
+    // Existing terms take precedence. Never combine a price or wallet from
+    // one chain list with an existing, different chain list.
+    if (hit.networks?.length && (hit.networks.length !== m.networks?.length
+        || !hit.networks.every((net) => m.networks.includes(net)))) return;
+    if (!hit.evmDomainByNetwork && m.evmDomainByNetwork) hit.evmDomainByNetwork = m.evmDomainByNetwork;
+    if (m.originDeclaredPrice != null && !hit.originDeclaredPrice) hit.originDeclaredPrice = m.originDeclaredPrice;
+  }
+  if (!hit.price && sellerNumText(m.price) !== undefined && m.price) hit.price = m.price;
+  // Settlement terms too, and this is the half that used to be missing. An
+  // OpenAPI document carries no payment metadata, so a row sourced from one
+  // has no chain and no payTo - and the manifest, which is exactly where the
+  // seller states both, could only supply them on a path nobody else had
+  // reported. A seller who documents their endpoint in OpenAPI AND declares
+  // it in their manifest therefore ended up listed with `network: null`,
+  // invisible to the router's chain match and to every per-chain market page.
+  // Blank-fill only: an observed live 402 outranks a manifest claim, so a row
+  // that already knows its chains keeps them.
+  if (!hit.networks?.length && m.networks?.length) hit.networks = [...m.networks];
+  if (!Object.keys(hit.payToByNetwork || {}).length && Object.keys(m.payToByNetwork || {}).length) {
+    hit.payToByNetwork = { ...m.payToByNetwork };
+    // Explicit, because the hit may be a Bazaar row whose provenance would
+    // otherwise read these manifest addresses as the registry's.
+    hit.payToSourceByNetwork = Object.fromEntries(Object.keys(m.payToByNetwork).map((net) => [net, "origin"]));
+  } else {
+    // The one exception to blank-fill: an address only a REGISTRY carries
+    // for a network the manifest names is replaced by the manifest's. The
+    // manifest is the origin's own current word on where it is paid; the
+    // registry row records where an earlier payment went, which is a wallet
+    // the seller may have since left (2026-10-03, see payToSourceOf). An
+    // address the origin's OpenAPI or live 402 gave the row is untouched.
+    for (const [net, addr] of Object.entries(m.payToByNetwork || {})) {
+      if (typeof addr !== "string" || !addr) continue;
+      if (hit.payToByNetwork?.[net] && payToSourceOf(hit, net) === "registry") setRowPayTo(hit, net, addr, "origin");
+    }
+  }
+  if (!hit.stellarPayTo && m.stellarPayTo) hit.stellarPayTo = m.stellarPayTo;
+  if (!hit.algorandPayTo && m.algorandPayTo) hit.algorandPayTo = m.algorandPayTo;
+}
+
 // Fold a manifest catalogue into the rows we already have, WITHOUT inflating
 // and WITHOUT silently dropping the seller's variants.
 //
@@ -3570,64 +3691,42 @@ export function dropUnvouchedNonProductRoutes(tools = [], vouchedRoutes = []) {
 // The manifest still wins on description, which is the whole reason to read it.
 export function mergeManifestIntoTools(manifestTools = [], existing = []) {
   if (!manifestTools.length) return existing.slice();
-  // Group the seller's entries by pathname first, because how many they
-  // advertise on one path is what decides the merge.
+  // On paths with a v2 item, keep the full operation keys. A bare path row
+  // may describe a different operation and retains its own evidence.
+  // Other paths keep the legacy grouping and variant replacement below.
+  const exactPaths = new Set(manifestTools.filter((m) => m.manifestExactItem).map((m) => pathOf(m.route)));
   const groups = new Map();
   for (const m of manifestTools) {
     const path = String(m.route || "").split("?")[0];
-    if (!path) continue;
+    if (!path || exactPaths.has(path)) continue;
     if (!groups.has(path)) groups.set(path, []);
     groups.get(path).push(m);
   }
+  const byExact = new Map();
   const indicesByPath = new Map();
   existing.forEach((t, i) => {
     const p = String(t.route || "").split("?")[0];
     if (!p) return;
+    if (exactPaths.has(p)) {
+      const key = manifestRouteKey(t);
+      if (!byExact.has(key)) byExact.set(key, []);
+      byExact.get(key).push(t);
+      return;
+    }
     if (!indicesByPath.has(p)) indicesByPath.set(p, []);
     indicesByPath.get(p).push(i);
   });
   const replaced = new Set();
   const append = [];
-  const enrich = (hit, m) => {
-    if (!hit.name || hit.name === hit.route || String(hit.name).startsWith("/")) hit.name = m.name || hit.name;
-    if (!hit.description) hit.description = m.description || "";
-    if (!hit.price && sellerNumText(m.price) !== undefined && m.price) hit.price = m.price;
-    if ((!hit.slug || hit.slug === hit.route) && m.slug) hit.slug = m.slug;
-    // Settlement terms too, and this is the half that used to be missing. An
-    // OpenAPI document carries no payment metadata, so a row sourced from one
-    // has no chain and no payTo - and the manifest, which is exactly where the
-    // seller states both, could only supply them on a path nobody else had
-    // reported. A seller who documents their endpoint in OpenAPI AND declares
-    // it in their manifest therefore ended up listed with `network: null`,
-    // invisible to the router's chain match and to every per-chain market page.
-    // Blank-fill only: an observed live 402 outranks a manifest claim, so a row
-    // that already knows its chains keeps them.
-    if (!hit.networks?.length && m.networks?.length) hit.networks = [...m.networks];
-    if (!Object.keys(hit.payToByNetwork || {}).length && Object.keys(m.payToByNetwork || {}).length) {
-      hit.payToByNetwork = { ...m.payToByNetwork };
-      // Explicit, because the hit may be a Bazaar row whose provenance would
-      // otherwise read these manifest addresses as the registry's.
-      hit.payToSourceByNetwork = Object.fromEntries(Object.keys(m.payToByNetwork).map((net) => [net, "origin"]));
+  for (const m of manifestTools) {
+    if (!exactPaths.has(pathOf(m.route))) continue;
+    const hits = byExact.get(manifestRouteKey(m));
+    if (hits) {
+      for (const hit of hits) enrichManifestToolRow(hit, m);
     } else {
-      // The one exception to blank-fill: an address only a REGISTRY carries
-      // for a network the manifest names is replaced by the manifest's. The
-      // manifest is the origin's own current word on where it is paid; the
-      // registry row records where an earlier payment went, which is a wallet
-      // the seller may have since left (2026-10-03, see payToSourceOf). An
-      // address the origin's OpenAPI or live 402 gave the row is untouched.
-      for (const [net, addr] of Object.entries(m.payToByNetwork || {})) {
-        if (typeof addr !== "string" || !addr) continue;
-        if (hit.payToByNetwork?.[net] && payToSourceOf(hit, net) === "registry") setRowPayTo(hit, net, addr, "origin");
-      }
+      append.push(m);
     }
-    if (!hit.stellarPayTo && m.stellarPayTo) hit.stellarPayTo = m.stellarPayTo;
-    if (!hit.algorandPayTo && m.algorandPayTo) hit.algorandPayTo = m.algorandPayTo;
-    // Blank-fill: a contract read from the seller's OpenAPI outranks one read
-    // from a manifest schema.
-    // A manifest's names also fill an OpenAPI "requires nothing": an operation
-    // documented with no parameters says less than a schema listing fields.
-    if (requestContractStrength(m.requestContract) > requestContractStrength(hit.requestContract)) hit.requestContract = m.requestContract;
-  };
+  }
   for (const [path, entries] of groups) {
     const indices = indicesByPath.get(path) || [];
     if (!indices.length) {
@@ -3640,7 +3739,7 @@ export function mergeManifestIntoTools(manifestTools = [], existing = []) {
       // One advertised resource: fill blanks on EVERY observed method for this
       // path (OpenAPI often lists GET+POST). Adding nothing keeps the 16→30
       // guard; enriching only the first row left sibling methods thin.
-      for (const i of indices) enrich(existing[i], entries[0]);
+      for (const i of indices) enrichManifestToolRow(existing[i], entries[0]);
       continue;
     }
     // SEVERAL resources on one path. The rows we hold are that path seen
@@ -4470,13 +4569,14 @@ export function carryForwardLearnedQuotes(tools, prev) {
     const key = `${String(t.method || "GET").toUpperCase()} ${t.route}`;
     const heldExact = learnedExact.get(key);
     if (!heldExact || learnedQuote(t) || !learnedQuote(heldExact)) learnedExact.set(key, t);
+    if (t.manifestExactItem) continue;
     const heldRoute = learnedByRoute.get(t.route);
     if (!heldRoute || (!learnedQuote(heldRoute) && learnedQuote(t))) learnedByRoute.set(t.route, t);
   }
   if (!learnedExact.size) return tools;
   for (const t of tools) {
     const exact = learnedExact.get(`${String(t.method || "GET").toUpperCase()} ${t.route}`);
-    const hit = exact || learnedByRoute.get(t.route);
+    const hit = exact || (!t.manifestExactItem && learnedByRoute.get(t.route));
     if (!hit) continue;
     const fromQuote = learnedQuote(hit);
     // A route-level hit may change a current row's verb in exactly two cases:
@@ -4954,6 +5054,7 @@ export async function enrichLiveQuotes(tools, originUrl, { ignoreBudget = false,
     const example = tool.paid === false ? null : probeExampleFor(probeExamples, "POST", tool.route);
     probe: for (const { target, method, body: reqBody } of probeAttemptsFor(probeOrigin, tool, { example })) {
       if (pastDeadline()) break;
+      if (tool.manifestExactItem && (method !== own || target !== joinSellerRoute(probeOrigin, tool.route))) continue;
       try {
         // Crawled URLs are external data and could DNS-rebind between crawl and
         // now: validate then pin, exactly as probePaywall does.
@@ -5226,6 +5327,7 @@ async function probePaywall(tools, { redirectedTo = null } = {}) {
       && typeof t.route === "string" && t.route.startsWith("/")
       // A manifest row's "$0.005" is a price; a sentence is not (price-usd.js).
       && isPricedAboveZero(t.price)
+      && (!t.manifestExactItem || probeMethodsFor(t).length)
       // A slow origin is probed with GET only: a POST would send a body to its
       // write routes (feedback, reviews) just to read a price.
       && !(isSlowOrigin(t.seller) && String(t.method || "GET").toUpperCase() !== "GET")
